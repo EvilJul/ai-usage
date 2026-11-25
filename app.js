@@ -441,6 +441,7 @@ function windowLabel(w) {
     case 'daily': return '每日';
     case 'monthly': return '每月';
     case 'absolute': return '余额';
+    case 'used': return '已用';
     default: return w || '';
   }
 }
@@ -484,11 +485,19 @@ function renderQuotas(quotas) {
     return;
   }
 
-  // 有余额的排前，余额少的排前（更值得注意）
+  // 排序：真余额（有 total 的、越少越靠前，更需要留意）
+  // → 余额类的绝对值 → 已用量 → 其它
+  const rank = (q) => {
+    if (q.window_key === 'used') return 2;
+    if (q.remaining == null) return 3;
+    return q.total ? 0 : 1;
+  };
   meaningful.sort((a, b) => {
-    const av = a.remaining != null ? a.remaining : Infinity;
-    const bv = b.remaining != null ? b.remaining : Infinity;
-    if (av !== bv) return av - bv;
+    const ra = rank(a); const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    if (ra === 0) return (a.remaining / a.total) - (b.remaining / b.total);
+    if (ra === 1) return (a.remaining ?? 0) - (b.remaining ?? 0);
+    if (ra === 2) return (b.remaining ?? 0) - (a.remaining ?? 0);
     return String(a.provider_label).localeCompare(String(b.provider_label));
   });
 
