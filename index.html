@@ -2,82 +2,106 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<title>AI 用量汇总</title>
-<link rel="stylesheet" href="./style.css?v=a500bfdd">
+<meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
+<title>AI 用量</title>
+<link rel="stylesheet" href="./style.css?v=bdf1bfad">
 </head>
 <body>
-<header>
-  <h1>AI 用量汇总</h1>
-  <div class="controls">
-    <label>范围
-      <select id="range">
-        <option value="7">近 7 天</option>
-        <option value="30" selected>近 30 天</option>
-        <option value="90">近 90 天</option>
-        <option value="365">近一年</option>
-        <option value="all">全部</option>
-      </select>
-    </label>
-    <label>设备 <select id="machine"><option value="">全部</option></select></label>
-    <label>应用 <select id="app"><option value="">全部</option></select></label>
-    <span id="status" class="status"></span>
+
+<!-- 加密站的口令门 -->
+<section class="gate" id="unlock" hidden>
+  <div class="gate-inner">
+    <div class="gate-icon" aria-hidden="true">🔒</div>
+    <h1>已加密</h1>
+    <p class="gate-hint">输入查看口令。口令只在本机浏览器里用于解密，不会发送到任何地方。</p>
+    <form id="unlock-form">
+      <input type="password" id="pass" placeholder="查看口令" autocomplete="current-password"
+             autocapitalize="off" autocorrect="off" spellcheck="false" required>
+      <button type="submit">打开</button>
+    </form>
+    <div id="unlock-msg" class="gate-msg" role="alert"></div>
+  </div>
+</section>
+
+<header class="bar">
+  <div class="bar-inner">
+    <h1 class="brand">AI 用量</h1>
+    <nav class="tabs" id="range-tabs" role="tablist" aria-label="时间范围">
+      <button type="button" role="tab" data-days="1">今天</button>
+      <button type="button" role="tab" data-days="7">7 天</button>
+      <button type="button" role="tab" data-days="30" aria-selected="true" class="on">30 天</button>
+      <button type="button" role="tab" data-days="0">全部</button>
+    </nav>
   </div>
 </header>
 
 <main>
-  <!-- 加密静态站：在页面上要口令，不用浏览器 prompt -->
-  <section class="panel unlock" id="unlock" hidden>
-    <h2>这个页面已加密</h2>
-    <p class="hint">输入查看口令。口令只在这个浏览器里用于解密，不会发送到任何地方。</p>
-    <form id="unlock-form" class="unlock-row">
-      <input type="password" id="pass" placeholder="查看口令" autocomplete="current-password" required>
-      <button type="submit" class="btn">打开</button>
-    </form>
-    <div id="unlock-msg" class="unlock-msg"></div>
+
+  <!-- 今天：最重要的数字放最前 -->
+  <section class="today" id="today-block">
+    <div class="today-main">
+      <div class="today-label">今天</div>
+      <div class="today-cost" id="today-cost">—</div>
+      <div class="today-sub" id="today-sub"></div>
+    </div>
+    <div class="today-side" id="today-side"></div>
   </section>
 
-  <section class="cards" id="cards"></section>
+  <section class="kpis" id="kpis"></section>
 
   <section class="panel">
-    <h2>每日用量</h2>
-    <div id="chart" class="chart"></div>
+    <div class="panel-head">
+      <h2>每日花费</h2>
+      <span class="panel-note" id="chart-note"></span>
+    </div>
+    <div class="chart" id="chart"></div>
   </section>
 
   <section class="panel">
-    <h2>额度</h2>
-    <p class="hint">额度是<b>账号级</b>的，跨设备不累加。同一账号多台机器上报时取最新观测，冲突会标注。</p>
-    <div id="quotas" class="quotas"></div>
+    <div class="panel-head">
+      <h2>剩余额度</h2>
+    </div>
+    <p class="hint">额度按<b>账号</b>算，不是按设备。同一账号在多台机器上只显示一条。</p>
+    <div class="quotas" id="quotas"></div>
   </section>
 
-  <div class="two-col">
-    <section class="panel">
-      <h2>按账号</h2>
-      <div id="accounts"></div>
-    </section>
-    <section class="panel">
-      <h2>按模型</h2>
-      <div id="models"></div>
-    </section>
-  </div>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>账号</h2>
+      <span class="panel-note">按花费排序</span>
+    </div>
+    <div id="accounts"></div>
+  </section>
 
   <section class="panel">
-    <h2>按设备</h2>
-    <p class="hint">用量按设备相加（每台机器的请求都真实发生）；额度不参与相加。</p>
+    <div class="panel-head">
+      <h2>模型</h2>
+      <span class="panel-note">按花费排序</span>
+    </div>
+    <div id="models"></div>
+  </section>
+
+  <section class="panel" id="machines-panel" hidden>
+    <div class="panel-head">
+      <h2>设备</h2>
+      <span class="panel-note">用量按设备相加</span>
+    </div>
     <div id="machines"></div>
   </section>
 
   <section class="panel" id="admin-panel" hidden>
-    <h2>账号管理</h2>
-    <p class="hint">若同一账号在不同机器上名字不同，把它合并到一个账号下。合并只改归属，不改历史数据。</p>
+    <div class="panel-head"><h2>账号管理</h2></div>
+    <p class="hint">同一账号在不同机器上名字不同时，合并到一个账号下。只改归属，不改历史。</p>
     <div id="admin"></div>
   </section>
+
 </main>
 
-<footer>
-  <span id="foot"></span>
-</footer>
-<script src="./app.js?v=84bab68c"></script>
+<footer id="foot"></footer>
+
+<script src="./app.js?v=5d65285f"></script>
 </body>
 </html>

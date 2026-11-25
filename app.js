@@ -1,31 +1,31 @@
 'use strict';
 /**
- * 前端：两种部署模式共用同一套代码。
+ * AI 用量前端。两种部署模式共用同一套代码：
+ *   - server：从 /api/* 取数
+ *   - static：读 data/ 下的预生成文件，在浏览器里解密并合并各机器数据
  *
- *  - server 模式（默认）：从 /api/* 实时取数，需要后端。
- *  - static 模式（GitHub Pages）：读同目录 data/ 下的预生成 JSON，纯静态托管。
- *
- * 判定方式：页面 <html data-mode="static"> 或在 data/config.json 里写 {"mode":"static"}。
- * 静态模式下，「账号管理」只显示提示，不做写操作。
+ * 展示原则（用户明确要求）：数据是给人看的，不是抓到了就全列出来。
+ *   - 今天的数字放最前，因为它是最常被问的
+ *   - 空值 / 无意义的条目直接不显示，而不是显示 0 或「无数据」
+ *   - 数字按量级缩写（1.2K / 3.4M / 5.6B），不丢有效位数
  */
 
 const state = {
   mode: 'server',
   encrypted: false,
   snapshotMs: 0,
-  from: '',
-  to: '',
-  machine: '',
-  app: '',
+  days: 30,        // 0 = 全部
   summary: null,
   quotas: [],
   machines: [],
-  adminOpen: false,
+  accountsExpanded: false,
+  modelsExpanded: false,
 };
 
-// ---------- 工具 ----------
-
 const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => [...document.querySelectorAll(sel)];
+
+// ---------- 格式化 ----------
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
@@ -33,25 +33,30 @@ function esc(s) {
   }[c]));
 }
 
+/** 整数缩写：1.2K / 3.4M / 5.6B，保留三位有效数字 */
 function fmtInt(n) {
-  if (n == null) return '—';
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'K';
+  if (n == null || !Number.isFinite(n)) return '—';
+  const a = Math.abs(n);
+  if (a >= 1e9) return (n / 1e9).toFixed(a >= 1e10 ? 1 : 2) + 'B';
+  if (a >= 1e6) return (n / 1e6).toFixed(a >= 1e7 ? 1 : 2) + 'M';
+  if (a >= 1e4) return (n / 1e3).toFixed(a >= 1e5 ? 0 : 1) + 'K';
   return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
+/** 金额：小于 1 分也显示，不显示成 $0 */
 function fmtUSD(micro) {
-  if (micro == null) return '—';
+  if (micro == null || !Number.isFinite(micro)) return '—';
   const v = micro / 1e6;
-  if (v >= 1000) return '$' + (v / 1000).toFixed(2) + 'K';
+  if (v === 0) return '$0';
+  if (v >= 10000) return '$' + (v / 1000).toFixed(1) + 'K';
+  if (v >= 100) return '$' + v.toFixed(0);
   if (v >= 1) return '$' + v.toFixed(2);
-  if (v > 0) return '$' + v.toFixed(3);
-  return '$0';
+  if (v >= 0.01) return '$' + v.toFixed(3);
+  return '$' + v.toFixed(4);
 }
 
-function fmtNum(v, unit) {
-  if (v == null) return '未采集';
+function fmtMoney(v, unit) {
+  if (v == null) return '—';
   if (unit === 'USD') return '$' + v.toFixed(2);
   if (unit === 'CNY') return '¥' + v.toFixed(2);
   if (unit === 'percent') return v.toFixed(1) + '%';
@@ -59,49 +64,39 @@ function fmtNum(v, unit) {
   return String(v);
 }
 
-function fmtTime(ms) {
+/** 相对时间：刚刚 / 12 分钟前 / 3 小时前 / 10-24 */
+function fmtAgo(ms) {
   if (!ms) return '—';
+  const diff = Date.now() - ms;
+  if (diff < 0) return '即将';
+  if (diff < 90e3) return '刚刚';
+  if (diff < 3600e3) return Math.floor(diff / 60e3) + ' 分钟前';
+  if (diff < 86400e3) return Math.floor(diff / 3600e3) + ' 小时前';
   const d = new Date(ms);
-  const now = Date.now();
-  const diff = now - ms;
-  if (diff < 60000) return '刚刚';
-  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
-  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
-  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-function isoDaysAgo(n) {
+function fmtClock(ms) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+const dayKey = (d) => {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+function daysAgoKey(n) {
   const d = new Date();
   d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
+  return dayKey(d);
 }
 
-// ---------- 数据源 ----------
+// ---------- 静态模式：解密与合并 ----------
 
-async function loadJSON(path) {
-  // 静态模式加时间戳避免 CDN 缓存陈旧
-  const url = state.mode === 'static' ? `${path}?t=${Math.floor(Date.now() / 60000)}` : path;
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
-function buildQuery() {
-  const p = new URLSearchParams();
-  if (state.from) p.set('from', state.from);
-  if (state.to) p.set('to', state.to);
-  if (state.machine) p.set('machine', state.machine);
-  if (state.app) p.set('app', state.app);
-  return p.toString();
-}
-
-// ---------- 静态模式：在浏览器里合并各机器数据 ----------
-//
-// 没有后端，所以跨机汇总必须在浏览器完成：
-// 每台机器发布自己的一个数据文件，这里全部拉下来解密、合并、按需聚合。
-
-let staticData = null; // {rows, quotas, machines, priceIdx}
-let staticPass = null; // 口令只在内存里
+let staticData = null;
+let staticPass = null;
 
 function b64ToBytes(b64) {
   const bin = atob(b64);
@@ -111,15 +106,13 @@ function b64ToBytes(b64) {
 }
 
 async function decryptJSON(enc, passphrase) {
-  const encBuf = await crypto.subtle.importKey(
+  const raw = await crypto.subtle.importKey(
     'raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
   const key = await crypto.subtle.deriveKey(
     { name: 'PBKDF2', salt: b64ToBytes(enc.salt), iterations: enc.iter, hash: 'SHA-256' },
-    encBuf, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-  // ct 尾部带 GCM auth tag，WebCrypto 直接接受
+    raw, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
   let plain = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: b64ToBytes(enc.iv) }, key, b64ToBytes(enc.ct));
-  // v2 是 gzip 后再加密的
   if (enc.enc === 'gzip+aes-256-gcm') {
     plain = await new Response(
       new Blob([plain]).stream().pipeThrough(new DecompressionStream('gzip')),
@@ -128,15 +121,14 @@ async function decryptJSON(enc, passphrase) {
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
-/** 价格表索引。兼容紧凑格式 [name, in, out, cr, cc] 与旧的对象格式 */
+/** 价格表索引（与采集端口径一致） */
 function buildPriceIdx(prices) {
   const eff = (prices && prices.d) || '1970-01-01';
   const idx = new Map();
   for (const m of (prices && prices.models) || []) {
     let name; let input; let output; let cacheRead; let cacheCreate;
-    if (Array.isArray(m)) {
-      [name, input, output, cacheRead, cacheCreate] = m;
-    } else {
+    if (Array.isArray(m)) [name, input, output, cacheRead, cacheCreate] = m;
+    else {
       name = m.model; input = m.input_per_mtok; output = m.output_per_mtok;
       cacheRead = m.cache_read_per_mtok; cacheCreate = m.cache_creation_per_mtok;
     }
@@ -144,10 +136,8 @@ function buildPriceIdx(prices) {
     if (!idx.has(name)) idx.set(name, []);
     idx.get(name).push({
       effective_from: (m && m.effective_from) || eff,
-      input: +input || 0,
-      output: +output || 0,
-      cacheRead: +cacheRead || 0,
-      cacheCreate: +cacheCreate || 0,
+      input: +input || 0, output: +output || 0,
+      cacheRead: +cacheRead || 0, cacheCreate: +cacheCreate || 0,
     });
   }
   for (const l of idx.values()) l.sort((a, b) => a.effective_from.localeCompare(b.effective_from));
@@ -164,7 +154,7 @@ function normalizeName(s) {
   return v;
 }
 
-function priceOf(priceIdx, row) {
+function costMicro(priceIdx, row) {
   const seen = new Set();
   const names = [];
   for (const c of [row.pricing_model, row.model, row.request_model]) {
@@ -178,30 +168,34 @@ function priceOf(priceIdx, row) {
     for (const p of list) if (p.effective_from <= row.date) best = p;
     return best || list[0] || null;
   };
+  let price = null;
   for (const n of names) {
     if (!n) continue;
     const exact = priceIdx.get(n);
-    if (exact) { const p = pick(exact); if (p) return p; }
+    if (exact) { price = pick(exact); if (price) break; }
     for (const [k, list] of priceIdx) {
-      if (normalizeName(k) === n) { const p = pick(list); if (p) return p; }
+      if (normalizeName(k) === n) { price = pick(list); if (price) break; }
     }
+    if (price) break;
   }
-  return null;
-}
-
-function costMicro(priceIdx, row) {
-  const p = priceOf(priceIdx, row);
-  if (!p) return 0;
+  if (!price) return 0;
   let input = row.input_tokens;
   if (row.input_token_semantics === 1) input = Math.max(0, input - row.cache_read_tokens);
-  const micro = input * p.input
-    + row.output_tokens * p.output
-    + row.cache_read_tokens * p.cacheRead
-    + row.cache_creation_tokens * p.cacheCreate;
+  const micro = input * price.input
+    + row.output_tokens * price.output
+    + row.cache_read_tokens * price.cacheRead
+    + row.cache_creation_tokens * price.cacheCreate;
   return Number.isFinite(micro) && micro > 0 ? Math.round(micro) : 0;
 }
 
-/** 等用户在页面上输入口令 */
+async function loadJSON(path) {
+  const url = state.mode === 'static' ? `${path}?t=${Math.floor(Date.now() / 300000)}` : path;
+  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+/** 口令门：等用户在页面上输入 */
 function askPassphrase() {
   return new Promise((resolve) => {
     document.body.classList.add('locked');
@@ -212,7 +206,7 @@ function askPassphrase() {
     panel.hidden = false;
     msg.textContent = '';
     input.value = '';
-    input.focus();
+    setTimeout(() => input.focus(), 50);
 
     const onSubmit = (e) => {
       e.preventDefault();
@@ -227,17 +221,6 @@ function askPassphrase() {
   });
 }
 
-/** 口令错误时重来 */
-async function retryPassphrase(reason) {
-  const msg = $('#unlock-msg');
-  if (msg) msg.textContent = reason;
-  const panel = $('#unlock');
-  if (panel) panel.hidden = false;
-  const input = $('#pass');
-  if (input) { input.value = ''; input.focus(); }
-}
-
-/** 拉取所有机器文件并合并 */
 async function loadStaticData() {
   if (staticData) return staticData;
   const index = await loadJSON('./data/index.json');
@@ -249,420 +232,472 @@ async function loadStaticData() {
   const machines = [];
 
   for (const m of index.machines || []) {
-    let doc;
     const raw = await loadJSON('./data/' + m.file);
+    let doc;
     if (index.encrypted) {
-      if (!staticPass) {
-        document.body.classList.add('locked');
-        staticPass = await askPassphrase();
-      }
+      if (!staticPass) staticPass = await askPassphrase();
       try {
         doc = await decryptJSON(raw, staticPass);
       } catch {
-        // 口令错：清掉已解出的数据，回到输入框
         staticData = null;
         staticPass = null;
-        document.body.classList.remove('locked');
-        await retryPassphrase('口令不正确，请重试。');
+        document.body.classList.add('locked');
+        $('#unlock').hidden = false;
+        $('#unlock-msg').textContent = '口令不正确，请重试。';
+        $('#pass').value = '';
+        $('#pass').focus();
         throw new Error('口令不正确');
       }
     } else {
       doc = raw;
     }
+
+    const label = doc.machine_label || String(doc.machine_id).slice(0, 8);
     for (const r of doc.usage || []) {
       rows.push({
         ...r,
         machine_id: doc.machine_id,
-        machine_label: doc.machine_label || String(doc.machine_id).slice(0, 8),
+        machine_label: label,
         cost_micro_usd: costMicro(priceIdx, r),
       });
     }
     for (const q of doc.quotas || []) quotas.push(q);
-    machines.push({
-      machine_id: doc.machine_id,
-      label: doc.machine_label || String(doc.machine_id).slice(0, 8),
-      last_seen_ms: doc.generated_at_ms,
-    });
+    machines.push({ machine_id: doc.machine_id, label, last_seen_ms: doc.generated_at_ms });
   }
 
-  staticData = { rows, quotas, machines, priceIdx, snapshotMs: index.generated_at_ms };
-  document.body.classList.remove('locked');
-  const panel = $('#unlock');
-  if (panel) panel.hidden = true;
+  staticData = { rows, quotas, machines, snapshotMs: index.generated_at_ms };
   return staticData;
 }
 
-// ---------- 聚合（静态模式在浏览器里做） ----------
+// ---------- 聚合 ----------
 
-const EMPTY_AGG = () => ({
+const emptyAgg = () => ({
   request_count: 0, success_count: 0, input_tokens: 0, output_tokens: 0,
   cache_read_tokens: 0, cache_creation_tokens: 0, cost_micro_usd: 0,
 });
 
 function addInto(acc, r) {
-  acc.request_count += r.request_count;
-  acc.success_count += r.success_count;
-  acc.input_tokens += r.input_tokens;
-  acc.output_tokens += r.output_tokens;
-  acc.cache_read_tokens += r.cache_read_tokens;
-  acc.cache_creation_tokens += r.cache_creation_tokens;
-  acc.cost_micro_usd += r.cost_micro_usd;
+  acc.request_count += r.request_count || 0;
+  acc.success_count += r.success_count || 0;
+  acc.input_tokens += r.input_tokens || 0;
+  acc.output_tokens += r.output_tokens || 0;
+  acc.cache_read_tokens += r.cache_read_tokens || 0;
+  acc.cache_creation_tokens += r.cache_creation_tokens || 0;
+  acc.cost_micro_usd += r.cost_micro_usd || 0;
 }
 
 function groupBy(rows, keyFn, labelFn) {
   const m = new Map();
   for (const r of rows) {
     const k = keyFn(r);
-    if (!m.has(k)) m.set(k, { key: k, label: labelFn(r), ...EMPTY_AGG() });
+    if (!m.has(k)) m.set(k, { key: k, label: labelFn(r), ...emptyAgg() });
     addInto(m.get(k), r);
   }
   return [...m.values()].sort((a, b) => b.cost_micro_usd - a.cost_micro_usd);
 }
 
-function aggregateRows(rows) {
-  const total = EMPTY_AGG();
-  for (const r of rows) addInto(total, r);
-  const days = groupBy(rows, (r) => r.date, (r) => r.date)
-    .sort((a, b) => a.key.localeCompare(b.key));
-  return {
-    total,
-    days,
-    models: groupBy(rows, (r) => r.model, (r) => r.model),
-    accounts: groupBy(rows, (r) => r.account_key, (r) => r.provider_label || r.account_key),
-    machines: groupBy(rows, (r) => r.machine_id, (r) => r.machine_label),
-    apps: groupBy(rows, (r) => r.app_type, (r) => r.app_type),
-  };
-}
+// ---------- 渲染：今天 ----------
 
-/** 静态模式下按当前筛选条件从内存算一份 summary */
-function summaryFromFilters() {
-  const d = staticData;
-  const rows = d.rows.filter((r) => {
-    if (r.date < state.from || r.date > state.to) return false;
-    if (state.machine && r.machine_id !== state.machine) return false;
-    if (state.app && r.app_type !== state.app) return false;
-    return true;
-  });
-  return aggregateRows(rows);
-}
+function renderToday(allRows) {
+  const today = dayKey(new Date());
+  const yest = daysAgoKey(1);
 
-async function fetchData() {
-  if (state.mode === 'static') {
-    const d = await loadStaticData();
-    return { summary: summaryFromFilters(), quotas: d.quotas, machines: d.machines };
+  const t = emptyAgg();
+  let tRows = 0;
+  for (const r of allRows) if (r.date === today) { addInto(t, r); tRows++; }
+
+  const y = emptyAgg();
+  for (const r of allRows) if (r.date === yest) addInto(y, r);
+
+  $('#today-cost').textContent = tRows ? fmtUSD(t.cost_micro_usd) : '—';
+
+  const okRate = t.request_count > 0
+    ? (t.success_count / t.request_count * 100).toFixed(1)
+    : null;
+
+  $('#today-sub').innerHTML = tRows
+    ? `<span class="num">${fmtInt(t.request_count)}</span> 次请求` +
+      (okRate ? `　成功 <span class="num">${okRate}%</span>` : '') +
+      `　<span class="num">${fmtInt(t.input_tokens + t.output_tokens)}</span> tokens`
+    : '今天还没有用量';
+
+  // 与昨天同期对比
+  const side = [];
+  if (tRows && y.request_count > 0) {
+    const diff = t.cost_micro_usd - y.cost_micro_usd;
+    const pct = y.cost_micro_usd > 0 ? (diff / y.cost_micro_usd) * 100 : 0;
+    const cls = diff > 0 ? 'delta-up' : diff < 0 ? 'delta-down' : '';
+    const arrow = diff > 0 ? '↑' : diff < 0 ? '↓' : '→';
+    side.push(`<div><div class="k">对比昨天</div>
+      <div class="v ${cls}">${arrow} ${Math.abs(pct).toFixed(0)}%</div></div>`);
+    side.push(`<div><div class="k">昨天</div>
+      <div class="v num">${fmtUSD(y.cost_micro_usd)}</div></div>`);
   }
-  const [summary, q, m] = await Promise.all([
-    loadJSON('/api/summary?' + buildQuery()),
-    loadJSON('/api/quotas'),
-    loadJSON('/api/machines'),
-  ]);
-  return { summary, quotas: q.quotas || [], machines: m.machines || [] };
+  if (t.request_count > 0) {
+    side.push(`<div><div class="k">今日 token</div>
+      <div class="v num">${fmtInt(t.input_tokens + t.output_tokens)}</div></div>`);
+  }
+  $('#today-side').innerHTML = side.join('');
 }
 
-// ---------- 渲染 ----------
+// ---------- 渲染：KPI ----------
 
-function renderCards(total) {
-  const el = $('#cards');
+function renderKpis(total) {
   const okRate = total.request_count > 0
     ? (total.success_count / total.request_count * 100).toFixed(1) + '%'
-    : '—';
-  const totalTokens = total.input_tokens + total.output_tokens;
-  const cacheHit = (total.input_tokens + total.cache_read_tokens) > 0
-    ? (total.cache_read_tokens / (total.input_tokens + total.cache_read_tokens) * 100).toFixed(1) + '%'
-    : '—';
+    : null;
+  const cacheBase = total.input_tokens + total.cache_read_tokens;
+  const cacheHit = cacheBase > 0 ? (total.cache_read_tokens / cacheBase * 100).toFixed(0) + '%' : null;
 
-  el.innerHTML = `
-    <div class="card"><div class="k">花费</div><div class="v">${fmtUSD(total.cost_micro_usd ?? total.client_cost_micro_usd)}</div>
-      <div class="s">按服务端统一价格重算</div></div>
-    <div class="card"><div class="k">请求数</div><div class="v">${fmtInt(total.request_count)}</div>
-      <div class="s">成功 ${okRate}</div></div>
-    <div class="card"><div class="k">输入 token</div><div class="v">${fmtInt(total.input_tokens)}</div>
-      <div class="s">输出 ${fmtInt(total.output_tokens)}</div></div>
-    <div class="card"><div class="k">缓存读取</div><div class="v">${fmtInt(total.cache_read_tokens)}</div>
-      <div class="s">缓存占比 ${cacheHit}</div></div>
-    <div class="card"><div class="k">创建缓存</div><div class="v">${fmtInt(total.cache_creation_tokens)}</div>
-      <div class="s">两列合计 ${fmtInt(totalTokens)}</div></div>
-  `;
+  const items = [
+    ['总花费', fmtUSD(total.cost_micro_usd), '统一价格表重算'],
+    ['请求', fmtInt(total.request_count), okRate ? `成功 ${okRate}` : ''],
+    ['输入', fmtInt(total.input_tokens), total.output_tokens ? `输出 ${fmtInt(total.output_tokens)}` : ''],
+    ['缓存读取', fmtInt(total.cache_read_tokens), cacheHit ? `占比 ${cacheHit}` : ''],
+    ['缓存写入', fmtInt(total.cache_creation_tokens), ''],
+  ];
+
+  $('#kpis').innerHTML = items
+    // 值为 0 且没有补充说明的，不占位
+    .filter(([, v, s]) => v !== '0' && v !== '—' || s)
+    .map(([k, v, s]) => `<div class="kpi">
+        <div class="k">${esc(k)}</div>
+        <div class="v num">${esc(v)}</div>
+        ${s ? `<div class="s">${esc(s)}</div>` : ''}
+      </div>`).join('');
 }
 
-/** 分组行的日期：后端按天分组时字段是 key，兼容 date */
-const dayOf = (d) => String(d.key || d.date || '');
+// ---------- 渲染：图表 ----------
 
-function renderChart(days) {
+function renderChart(days, windowDays) {
   const el = $('#chart');
-  if (!days || !days.length) {
-    el.innerHTML = '<div class="empty">这段时间没有数据</div>';
+  const series = days.slice().sort((a, b) => a.key.localeCompare(b.key));
+
+  let note = '';
+  if (windowDays === 1) {
+    note = '最近 14 天，今天高亮';
+  } else if (series.length > 1) {
+    note = `${series.length} 天`;
+  }
+
+  if (!series.length) {
+    el.innerHTML = '<div class="empty">这段时间没有用量</div>';
+    $('#chart-note').textContent = '';
     return;
   }
-  days = days.slice().sort((a, b) => dayOf(a).localeCompare(dayOf(b)));
-  const W = 900, H = 260, padL = 58, padR = 16, padT = 12, padB = 34;
-  const iw = W - padL - padR, ih = H - padT - padB;
-  const max = Math.max(...days.map((d) => d.cost_micro_usd || 0), 1);
-  const bw = Math.max(2, Math.min(38, iw / days.length - 3));
+  $('#chart-note').textContent = note;
 
-  const bars = days.map((d, i) => {
-    const x = padL + (iw * (i + 0.5)) / days.length - bw / 2;
-    const h = Math.max(1, ((d.cost_micro_usd || 0) / max) * ih);
+  const today = dayKey(new Date());
+  // 窄屏用更小的画布，保证柱子不会被压得太细
+  const narrow = window.innerWidth < 760;
+  const W = narrow ? 340 : 720;
+  const H = narrow ? 170 : 200;
+  const padL = narrow ? 40 : 46, padR = 8, padT = 10, padB = 22;
+  const iw = W - padL - padR;
+  const ih = H - padT - padB;
+  const max = Math.max(...series.map((d) => d.cost_micro_usd || 0), 1);
+  const gap = series.length > 20 ? 2 : 4;
+  const bw = Math.max(1.5, Math.min(40, iw / series.length - gap));
+
+  const bars = series.map((d, i) => {
+    const x = padL + (iw * (i + 0.5)) / series.length - bw / 2;
+    const h = Math.max(0.8, ((d.cost_micro_usd || 0) / max) * ih);
     const y = padT + ih - h;
-    return `<rect class="bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2">
-      <title>${esc(dayOf(d))}　${fmtUSD(d.cost_micro_usd)}　${fmtInt(d.request_count)} 次</title></rect>`;
+    const isToday = d.key === today;
+    return `<rect class="bar${isToday ? ' today' : ''}" x="${x.toFixed(1)}" y="${y.toFixed(1)}"
+      width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(2.5, bw / 3).toFixed(1)}">
+      <title>${esc(d.key)}　${fmtUSD(d.cost_micro_usd)}　${fmtInt(d.request_count)} 次</title></rect>`;
   }).join('');
 
-  // Y 轴三档
+  // Y 轴：0 / 中 / 顶
   const ticks = [0, 0.5, 1].map((f) => {
     const y = padT + ih - f * ih;
-    return `<line class="grid" x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"></line>
-            <text class="lbl" x="${padL - 8}" y="${y + 4}" text-anchor="end">${fmtUSD(max * f)}</text>`;
+    return `<line class="grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"></line>
+      <text class="lbl" x="${padL - 7}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${fmtUSD(max * f)}</text>`;
   }).join('');
 
-  // X 轴：首、中、尾
-  const xLabels = [0, Math.floor(days.length / 2), days.length - 1]
-    .filter((v, i, a) => a.indexOf(v) === i && days[v])
-    .map((i) => {
-      const x = padL + (iw * (i + 0.5)) / days.length;
-      return `<text class="lbl" x="${x.toFixed(1)}" y="${H - 12}" text-anchor="middle">${esc(dayOf(days[i]).slice(5))}</text>`;
-    }).join('');
+  // X 轴：均匀取 3 个点
+  const idxs = [...new Set([0, Math.floor(series.length / 2), series.length - 1])]
+    .filter((i) => series[i]);
+  const xLabels = idxs.map((i) => {
+    const x = padL + (iw * (i + 0.5)) / series.length;
+    return `<text class="lbl" x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle">${esc(series[i].key.slice(5))}</text>`;
+  }).join('');
 
-  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="每日花费柱状图">
-    ${ticks}<line class="axis" x1="${padL}" y1="${padT + ih}" x2="${W - padR}" y2="${padT + ih}"></line>
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="每日花费，最高 ${fmtUSD(max)}">
+    ${ticks}
+    <line class="axis" x1="${padL}" y1="${padT + ih}" x2="${W - padR}" y2="${padT + ih}"></line>
     ${bars}${xLabels}
   </svg>`;
 }
 
-/** 窗口名的中文说明 */
+// ---------- 渲染：额度 ----------
+
 function windowLabel(w) {
   switch (w) {
-    case '5h': return '5 小时窗口';
+    case '5h': return '5 小时';
     case 'weekly': return '每周';
     case 'daily': return '每日';
     case 'monthly': return '每月';
     case 'absolute': return '余额';
-    default: return w || '未知窗口';
+    default: return w || '';
   }
 }
 
 function renderQuotas(quotas) {
   const el = $('#quotas');
-  if (!quotas.length) {
-    el.innerHTML = `<div class="empty">还没有额度数据。<br>
-      额度需要在采集端配置各供应商的查询方式；部分供应商（官方订阅、余额类）暂不支持自动采集，可在采集端手动录入。</div>`;
-    return;
-  }
-  // 去重：同一份额度会在多个应用下、甚至多个域名上报多条。
-  //
-  // 实测的两种情况都必须收敛：
-  //  - codex 与 claude 各配一遍同一个 DeepSeek 账号 → account_key 只差 app 前缀
-  //  - MiniMax 国际站/国内站是两个域名（api.minimaxi.com / api.minimax.cn），
-  //    但背后是同一个账号 → 主机不同、账号名相同
-  // 所以只用「账号名」做键，主机与 app 都进不了键；主机仅用于同分时择一。
-  const deduped = new Map();
-  const accountName = (k) => String(k || '').split('|').slice(2).join('|').trim();
+
+  // 同一份额度会在多个应用/多个域名上报多条，按「账号名 + 窗口」收敛
+  const nameOf = (k) => String(k || '').split('|').slice(2).join('|').trim();
+  const merged = new Map();
   for (const q of quotas) {
-    const key = `${accountName(q.account_key)}\u0000${q.window_key}`;
-    const prev = deduped.get(key);
+    const key = `${nameOf(q.account_key)}\u0000${q.window_key}`;
+    const prev = merged.get(key);
     if (!prev) {
-      deduped.set(key, { ...q, apps: new Set([q.app_type]) });
+      merged.set(key, { ...q, apps: new Set([q.app_type]) });
     } else {
       prev.apps.add(q.app_type);
-      // 越新越优先；一样新则保留剩余更小的（保守）
       const newer = (q.observed_at_ms || 0) > (prev.observed_at_ms || 0);
-      const sameTime = (q.observed_at_ms || 0) === (prev.observed_at_ms || 0);
+      const same = (q.observed_at_ms || 0) === (prev.observed_at_ms || 0);
       const smaller = q.remaining != null && (prev.remaining == null || q.remaining < prev.remaining);
-      if (newer || (sameTime && smaller)) {
+      if (newer || (same && smaller)) {
         const apps = prev.apps;
-        deduped.set(key, { ...q, apps });
+        merged.set(key, { ...q, apps });
       }
     }
   }
 
-  // 有余额的排前面，其次按账号名
-  const list = [...deduped.values()].sort((a, b) => {
-    const av = a.remaining != null ? 1 : 0;
-    const bv = b.remaining != null ? 1 : 0;
-    if (av !== bv) return bv - av;
+  const list = [...merged.values()];
+
+  // 过滤：没有套餐额度、又不是余额的，属于噪音
+  const meaningful = list.filter((q) => {
+    const noPlan = q.unit === 'requests' && q.total === 0 && q.remaining === 0;
+    return !noPlan;
+  });
+
+  if (!meaningful.length) {
+    el.innerHTML = `<div class="empty">
+      没有可显示额度<br>
+      <span style="font-size:12px">供应商的额度查询没配置，或该账号没有余额信息</span>
+    </div>`;
+    return;
+  }
+
+  // 有余额的排前，余额少的排前（更值得注意）
+  meaningful.sort((a, b) => {
+    const av = a.remaining != null ? a.remaining : Infinity;
+    const bv = b.remaining != null ? b.remaining : Infinity;
+    if (av !== bv) return av - bv;
     return String(a.provider_label).localeCompare(String(b.provider_label));
   });
 
-  const html = [];
-  for (const q of list) {
-    const pct = (q.remaining != null && q.total) ? Math.max(0, Math.min(100, q.remaining / q.total * 100)) : null;
+  el.innerHTML = meaningful.map((q) => {
+    const pct = (q.remaining != null && q.total)
+      ? Math.max(0, Math.min(100, q.remaining / q.total * 100))
+      : null;
     const cls = pct == null ? '' : pct < 10 ? 'critical' : pct < 30 ? 'low' : '';
     const tags = [];
     if (q.stale) tags.push('<span class="tag warn">数据陈旧</span>');
-    if (q.conflict_note) tags.push(`<span class="tag warn" title="${esc(q.conflict_note)}">多机不一致</span>`);
-    // 重置时间只在它是未来时才有意义
+    if (q.conflict_note) tags.push('<span class="tag warn">多机不一致</span>');
     if (q.reset_at_ms && q.reset_at_ms > Date.now()) {
-      tags.push(`<span class="tag">${esc(fmtTime(q.reset_at_ms))}重置</span>`);
+      tags.push(`<span class="tag">${esc(fmtAgo(q.reset_at_ms))}重置</span>`);
     }
-    const apps = [...(q.apps || [q.app_type])].join(' / ');
-    // 套餐类 remaining=0 且 total=0 说明这个账号根本没有该套餐，别当「余额 0」吓人
-    const noPlan = q.unit === 'requests' && q.total === 0 && q.remaining === 0;
-    const numText = noPlan ? '<span class="win">无套餐额度</span>' : fmtNum(q.remaining, q.unit);
-    const totalText = (!noPlan && q.total) ? `<span class="win"> / ${fmtNum(q.total, q.unit)}</span>` : '';
+    const apps = [...(q.apps || [q.app_type])].join(' · ');
 
-    html.push(`<div class="quota ${q.stale ? 'stale' : ''}">
-        <div class="name"><span>${esc(q.provider_label)}</span>
-          <span class="win">${esc(windowLabel(q.window_key))}</span></div>
-        <div class="num">${numText}${totalText}</div>
-        ${pct != null && !noPlan ? `<div class="bar-wrap"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>` : ''}
-        <div class="meta">${esc(apps)}　观测 ${esc(fmtTime(q.observed_at_ms))}${tags.length ? ' ' + tags.join(' ') : ''}</div>
-      </div>`);
-  }
-  el.innerHTML = html.join('');
+    return `<div class="quota${q.stale ? ' stale' : ''}">
+      <div class="quota-top">
+        <span class="quota-name">${esc(q.provider_label)}</span>
+        <span class="quota-win">${esc(windowLabel(q.window_key))}</span>
+      </div>
+      <div class="quota-val num">${fmtMoney(q.remaining, q.unit)}${
+        q.total ? `<span class="of"> / ${fmtMoney(q.total, q.unit)}</span>` : ''
+      }</div>
+      ${pct != null ? `<div class="quota-track"><div class="quota-fill ${cls}" style="width:${pct}%"></div></div>` : ''}
+      <div class="quota-meta"><span>${esc(apps)}</span><span>${esc(fmtAgo(q.observed_at_ms))}</span>${tags.join('')}</div>
+    </div>`;
+  }).join('');
 }
 
-function renderTable(el, rows, firstCol, maxRows = 12) {
+// ---------- 渲染：排行列表 ----------
+
+function renderRows(el, rows, opts = {}) {
+  const { expanded = false, limit = 8, onToggle = null, unit = 'cost' } = opts;
   if (!rows || !rows.length) {
     el.innerHTML = '<div class="empty">无数据</div>';
     return;
   }
-  const shown = rows.slice(0, maxRows);
-  el.innerHTML = `<table><thead><tr>
-      <th>${esc(firstCol)}</th><th>花费</th><th>请求</th><th>输入</th><th>输出</th><th>缓存读</th>
-    </tr></thead><tbody>
-    ${shown.map((r) => `<tr>
-      <td>${esc(r.label || r.key)}</td>
-      <td>${fmtUSD(r.cost_micro_usd)}</td>
-      <td>${fmtInt(r.request_count)}</td>
-      <td>${fmtInt(r.input_tokens)}</td>
-      <td>${fmtInt(r.output_tokens)}</td>
-      <td>${fmtInt(r.cache_read_tokens)}</td>
-    </tr>`).join('')}
-    ${rows.length > maxRows ? `<tr><td colspan="6" class="hint">还有 ${rows.length - maxRows} 项…</td></tr>` : ''}
-    </tbody></table>`;
-}
 
-function renderMachineSelect(machines) {
-  const sel = $('#machine');
-  const cur = sel.value;
-  sel.innerHTML = '<option value="">全部</option>' +
-    machines.map((m) => `<option value="${esc(m.machine_id)}">${esc(m.label || m.machine_id.slice(0, 8))}</option>`).join('');
-  sel.value = cur;
-}
+  const max = Math.max(...rows.map((r) => r.cost_micro_usd || 0), 1);
+  const shown = expanded ? rows : rows.slice(0, limit);
 
-function renderAdmin(accounts) {
-  const el = $('#admin');
-  if (state.mode === 'static') {
-    el.innerHTML = '<div class="empty">静态部署下不支持修改；如需合并账号，请在自建服务器版操作，或改采集端的账号别名配置。</div>';
-    return;
-  }
-  if (!accounts || !accounts.length) {
-    el.innerHTML = '<div class="empty">暂无账号</div>';
-    return;
-  }
-  el.innerHTML = accounts.map((a) => `
-    <div class="admin-row">
-      <span class="key">${esc(a.key)}</span>
-      <span>${esc(a.label || '')}</span>
-      <button class="btn" data-merge="${esc(a.key)}">合并到…</button>
-    </div>`).join('');
-  el.querySelectorAll('[data-merge]').forEach((b) => {
-    b.addEventListener('click', async () => {
-      const src = b.getAttribute('data-merge');
-      const target = prompt(`把「${src}」合并到哪个 account_key？\n（留空则取消合并）`, '');
-      if (target === null) return;
-      await postMerge(src, target.trim());
-      await refresh();
-    });
-  });
-}
+  const head = `<div class="row-head">
+    <span>名称</span><span>花费</span><span>请求</span><span>输入</span><span>输出</span><span>缓存</span>
+  </div>`;
 
-async function postMerge(accountKey, mergedInto) {
-  const res = await fetch('/api/accounts/merge', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ account_key: accountKey, merged_into: mergedInto }),
-  });
-  if (!res.ok) {
-    const t = await res.json().catch(() => ({}));
-    alert('合并失败：' + (t.error || res.status));
+  const body = shown.map((r) => {
+    const w = Math.max(1, Math.round((r.cost_micro_usd / max) * 100));
+    return `<div class="row">
+      <div class="row-name" title="${esc(r.label)}">${esc(r.label)}</div>
+      <div class="row-cost">${fmtUSD(r.cost_micro_usd)}</div>
+      <div class="row-meta">
+        <span class="bar-mini"><i style="width:${w}%"></i></span>
+        <span class="req">${fmtInt(r.request_count)} 次</span>
+        <span class="in">${fmtInt(r.input_tokens)}</span>
+        <span class="out">${fmtInt(r.output_tokens)}</span>
+        <span class="cache">${fmtInt(r.cache_read_tokens)}</span>
+      </div>
+    </div>`;
+  }).join('');
+
+  const more = rows.length > limit
+    ? `<button type="button" class="row more" data-toggle>
+        ${expanded ? '收起' : `还有 ${rows.length - limit} 项`}
+      </button>`
+    : '';
+
+  el.innerHTML = head + body + more;
+
+  if (onToggle) {
+    const b = el.querySelector('[data-toggle]');
+    if (b) b.addEventListener('click', onToggle);
   }
 }
 
 // ---------- 主流程 ----------
 
-function setStatus(text, isError) {
-  const el = $('#status');
-  el.textContent = text;
-  el.className = 'status' + (isError ? ' error' : '');
+function setFoot() {
+  const bits = [];
+  if (state.mode === 'static') {
+    bits.push(`数据截至 ${fmtClock(state.snapshotMs)}（${fmtAgo(state.snapshotMs)}）`);
+    bits.push('每日自动更新');
+  } else {
+    bits.push('自建服务 · 实时');
+  }
+  bits.push('不含任何凭据');
+  $('#foot').textContent = bits.join(' · ');
 }
 
 async function refresh() {
-  setStatus('加载中…');
-  const range = $('#range').value;
-  state.machine = $('#machine').value;
-  state.app = $('#app').value;
-  state.to = new Date().toISOString().slice(0, 10);
-  state.from = range === 'all' ? '2000-01-01' : isoDaysAgo(Number(range));
-
   try {
-    const { summary, quotas, machines } = await fetchData();
-    state.summary = summary;
-    state.quotas = quotas;
-    state.machines = machines;
+    let summary; let quotas; let machines; let allRows;
 
-    renderCards(summary.total || {});
-    renderChart(summary.days || []);
+    if (state.mode === 'static') {
+      const d = await loadStaticData();
+      allRows = d.rows;
+      quotas = d.quotas;
+      machines = d.machines;
+      state.snapshotMs = d.snapshotMs;
+    } else {
+      const days = state.days || 3650;
+      const from = daysAgoKey(days);
+      const to = dayKey(new Date());
+      const [s, q, m] = await Promise.all([
+        loadJSON(`/api/summary?from=${from}&to=${to}`),
+        loadJSON('/api/quotas'),
+        loadJSON('/api/machines'),
+      ]);
+      summary = s;
+      quotas = q.quotas || [];
+      machines = m.machines || [];
+      // server 模式没有原始行，用分组结果直接展示
+      allRows = null;
+      state.snapshotMs = Date.now();
+    }
+
+    if (allRows) {
+      const from = state.days ? daysAgoKey(state.days) : '0000-00-00';
+      const inRange = allRows.filter((r) => r.date >= from);
+
+      // 今天与 KPI 用全量行算，不受范围影响
+      renderToday(allRows);
+
+      const total = emptyAgg();
+      for (const r of inRange) addInto(total, r);
+      renderKpis(total);
+
+      // 选「今天」时，范围里只有一天，图表没有趋势可看 → 改画最近 14 天
+      const chartSrc = state.days === 1
+        ? allRows.filter((r) => r.date >= daysAgoKey(13))
+        : inRange;
+      const chartDays = groupBy(chartSrc, (r) => r.date, (r) => r.date)
+        .sort((a, b) => a.key.localeCompare(b.key));
+      renderChart(chartDays, state.days);
+
+      renderRows($('#accounts'), groupBy(inRange, (r) => r.account_key, (r) => r.provider_label || r.account_key),
+        { expanded: state.accountsExpanded, onToggle: () => { state.accountsExpanded = !state.accountsExpanded; refresh(); } });
+      renderRows($('#models'), groupBy(inRange, (r) => r.model, (r) => r.model),
+        { expanded: state.modelsExpanded, onToggle: () => { state.modelsExpanded = !state.modelsExpanded; refresh(); } });
+
+      const mrows = groupBy(inRange, (r) => r.machine_id, (r) => r.machine_label);
+      $('#machines-panel').hidden = mrows.length <= 1;
+      if (mrows.length > 1) renderRows($('#machines'), mrows, {});
+    } else {
+      // server 模式：后端已聚合好
+      renderTodayFallback(summary);
+      renderKpis(summary.total || {});
+      renderChart(summary.days || [], state.days);
+      renderRows($('#accounts'), summary.accounts || []);
+      renderRows($('#models'), summary.models || []);
+      const mrows = summary.machines || [];
+      $('#machines-panel').hidden = mrows.length <= 1;
+      if (mrows.length > 1) renderRows($('#machines'), mrows, {});
+    }
+
     renderQuotas(quotas);
-    renderTable($('#accounts'), summary.accounts, '账号');
-    renderTable($('#models'), summary.models, '模型');
-    renderTable($('#machines'), summary.machines, '设备');
-    renderMachineSelect(machines);
-    renderAdmin(summary.accounts);
-
-    // 应用下拉框取自全量数据，而不是当前筛选结果 ——
-    // 否则选了某个应用后，选项就只剩它自己，再也切不回去。
-    const allApps = state.mode === 'static'
-      ? [...new Set(staticData.rows.map((r) => r.app_type))].sort()
-      : (summary.apps || []).map((a) => a.key);
-    const appSel = $('#app');
-    const curApp = appSel.value;
-    appSel.innerHTML = '<option value="">全部</option>' +
-      allApps.map((a) => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
-    appSel.value = curApp;
-
-    const tot = summary.total || {};
-    const extra = state.mode === 'static'
-      ? `　·　静态快照 ${fmtTime(state.snapshotMs)}`
-      : '';
-    setStatus(`共 ${fmtInt(tot.request_count)} 次请求${extra}`);
+    setFoot();
   } catch (e) {
-    setStatus('加载失败：' + e.message, true);
+    console.error(e);
+    $('#today-cost').textContent = '—';
+    $('#today-sub').textContent = '加载失败：' + e.message;
   }
 }
 
+/** server 模式下没有原始行，用今天这一天的汇总近似渲染 */
+function renderTodayFallback(summary) {
+  const days = (summary.days || []).slice().sort((a, b) => a.key.localeCompare(b.key));
+  const today = dayKey(new Date());
+  const t = days.find((d) => d.key === today);
+  $('#today-cost').textContent = t ? fmtUSD(t.cost_micro_usd) : '—';
+  $('#today-sub').innerHTML = t
+    ? `<span class="num">${fmtInt(t.request_count)}</span> 次请求　<span class="num">${fmtInt(t.input_tokens + t.output_tokens)}</span> tokens`
+    : '今天还没有用量';
+  $('#today-side').innerHTML = '';
+  $('#chart-note').textContent = days.length > 1 ? `${days.length} 天` : '';
+}
+
+function bindTabs() {
+  $$('#range-tabs button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      $$('#range-tabs button').forEach((b) => {
+        b.classList.toggle('on', b === btn);
+        b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
+      });
+      state.days = Number(btn.dataset.days);
+      state.accountsExpanded = false;
+      state.modelsExpanded = false;
+      refresh();
+    });
+  });
+}
+
 async function boot() {
-  // 判定模式：存在 data/index.json 就是静态站
+  // 判定模式：存在 data/index.json 且 mode=static 就是静态站
   try {
-    const cfg = await fetch('./data/index.json', { cache: 'no-store' });
-    if (cfg.ok) {
-      const j = await cfg.json();
+    const res = await fetch('./data/index.json', { cache: 'no-store' });
+    if (res.ok) {
+      const j = await res.json();
       if (j.mode === 'static') {
         state.mode = 'static';
         state.encrypted = !!j.encrypted;
-        state.snapshotMs = j.generated_at_ms;
+        if (j.encrypted) document.body.classList.add('locked');
       }
     }
   } catch { /* 没有清单就是 server 模式 */ }
 
-  // 静态模式也能筛选（数据已在浏览器里，本地过滤即可）；
-  // 只有「账号管理」需要写后端，静态下隐藏。
-  $('#admin-panel').hidden = state.mode === 'static';
-
-  $('#range').addEventListener('change', refresh);
-  $('#machine').addEventListener('change', refresh);
-  $('#app').addEventListener('change', refresh);
-
-  $('#foot').textContent = state.mode === 'static'
-    ? '静态部署 · 数据为定时生成的快照 · 不含任何凭据'
-    : '自建服务 · 只接收日汇总数据 · 不含任何凭据';
-
+  bindTabs();
+  $('#admin-panel').hidden = true;
   await refresh();
-
-  if (state.mode !== 'static') {
-    // 60 秒自动刷新，小服务器压力可忽略
-    setInterval(() => { if (!document.hidden) refresh(); }, 60000);
-  }
 }
 
 boot();
