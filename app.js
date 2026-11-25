@@ -442,6 +442,7 @@ function windowLabel(w) {
     case 'monthly': return '每月';
     case 'absolute': return '余额';
     case 'used': return '已用';
+    case 'unknown': return '余额';
     default: return w || '';
   }
 }
