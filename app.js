@@ -448,13 +448,17 @@ function renderQuotas(quotas) {
       额度需要在采集端配置各供应商的查询方式；部分供应商（官方订阅、余额类）暂不支持自动采集，可在采集端手动录入。</div>`;
     return;
   }
-  // 去重：同一个账号（去掉 app_type 前缀后的「主机|账号名」相同）在多台机器/
-  // 多个应用下会各报一条，它们是同一份额度。按 (主机|账号名, 窗口) 收敛，
-  // 取观测最新的那条，并把出现过它的应用列出来。
+  // 去重：同一份额度会在多个应用下、甚至多个域名上报多条。
+  //
+  // 实测的两种情况都必须收敛：
+  //  - codex 与 claude 各配一遍同一个 DeepSeek 账号 → account_key 只差 app 前缀
+  //  - MiniMax 国际站/国内站是两个域名（api.minimaxi.com / api.minimax.cn），
+  //    但背后是同一个账号 → 主机不同、账号名相同
+  // 所以只用「账号名」做键，主机与 app 都进不了键；主机仅用于同分时择一。
   const deduped = new Map();
-  const stripApp = (k) => String(k || '').split('|').slice(1).join('|');
+  const accountName = (k) => String(k || '').split('|').slice(2).join('|').trim();
   for (const q of quotas) {
-    const key = `${stripApp(q.account_key)}\u0000${q.window_key}`;
+    const key = `${accountName(q.account_key)}\u0000${q.window_key}`;
     const prev = deduped.get(key);
     if (!prev) {
       deduped.set(key, { ...q, apps: new Set([q.app_type]) });
