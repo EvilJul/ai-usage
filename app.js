@@ -429,6 +429,18 @@ function renderChart(days) {
   </svg>`;
 }
 
+/** 窗口名的中文说明 */
+function windowLabel(w) {
+  switch (w) {
+    case '5h': return '5 小时窗口';
+    case 'weekly': return '每周';
+    case 'daily': return '每日';
+    case 'monthly': return '每月';
+    case 'absolute': return '余额';
+    default: return w || '未知窗口';
+  }
+}
+
 function renderQuotas(quotas) {
   const el = $('#quotas');
   if (!quotas.length) {
@@ -436,31 +448,61 @@ function renderQuotas(quotas) {
       额度需要在采集端配置各供应商的查询方式；部分供应商（官方订阅、余额类）暂不支持自动采集，可在采集端手动录入。</div>`;
     return;
   }
-  // 按账号分组：同一账号的多个窗口并列显示
-  const byAccount = new Map();
+  // 去重：同一个账号（去掉 app_type 前缀后的「主机|账号名」相同）在多台机器/
+  // 多个应用下会各报一条，它们是同一份额度。按 (主机|账号名, 窗口) 收敛，
+  // 取观测最新的那条，并把出现过它的应用列出来。
+  const deduped = new Map();
+  const stripApp = (k) => String(k || '').split('|').slice(1).join('|');
   for (const q of quotas) {
-    const k = q.account_key;
-    if (!byAccount.has(k)) byAccount.set(k, []);
-    byAccount.get(k).push(q);
-  }
-  const html = [];
-  for (const [, list] of byAccount) {
-    for (const q of list) {
-      const pct = (q.remaining != null && q.total) ? Math.max(0, Math.min(100, q.remaining / q.total * 100)) : null;
-      const cls = pct == null ? '' : pct < 10 ? 'critical' : pct < 30 ? 'low' : '';
-      const tags = [];
-      if (q.stale) tags.push('<span class="tag warn">数据陈旧</span>');
-      if (q.conflict_note) tags.push(`<span class="tag warn" title="${esc(q.conflict_note)}">多机不一致</span>`);
-      if (q.reset_at_ms) tags.push(`<span class="tag">${esc(fmtTime(q.reset_at_ms))} 重置</span>`);
-
-      html.push(`<div class="quota ${q.stale ? 'stale' : ''}">
-        <div class="name"><span>${esc(q.provider_label)}</span>
-          <span class="win">${esc(q.window_key)}</span></div>
-        <div class="num">${fmtNum(q.remaining, q.unit)}${q.total ? `<span class="win"> / ${fmtNum(q.total, q.unit)}</span>` : ''}</div>
-        ${pct != null ? `<div class="bar-wrap"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>` : ''}
-        <div class="meta">${esc(q.app_type)}　观测 ${esc(fmtTime(q.observed_at_ms))} ${tags.join(' ')}</div>
-      </div>`);
+    const key = `${stripApp(q.account_key)}\u0000${q.window_key}`;
+    const prev = deduped.get(key);
+    if (!prev) {
+      deduped.set(key, { ...q, apps: new Set([q.app_type]) });
+    } else {
+      prev.apps.add(q.app_type);
+      // 越新越优先；一样新则保留剩余更小的（保守）
+      const newer = (q.observed_at_ms || 0) > (prev.observed_at_ms || 0);
+      const sameTime = (q.observed_at_ms || 0) === (prev.observed_at_ms || 0);
+      const smaller = q.remaining != null && (prev.remaining == null || q.remaining < prev.remaining);
+      if (newer || (sameTime && smaller)) {
+        const apps = prev.apps;
+        deduped.set(key, { ...q, apps });
+      }
     }
+  }
+
+  // 有余额的排前面，其次按账号名
+  const list = [...deduped.values()].sort((a, b) => {
+    const av = a.remaining != null ? 1 : 0;
+    const bv = b.remaining != null ? 1 : 0;
+    if (av !== bv) return bv - av;
+    return String(a.provider_label).localeCompare(String(b.provider_label));
+  });
+
+  const html = [];
+  for (const q of list) {
+    const pct = (q.remaining != null && q.total) ? Math.max(0, Math.min(100, q.remaining / q.total * 100)) : null;
+    const cls = pct == null ? '' : pct < 10 ? 'critical' : pct < 30 ? 'low' : '';
+    const tags = [];
+    if (q.stale) tags.push('<span class="tag warn">数据陈旧</span>');
+    if (q.conflict_note) tags.push(`<span class="tag warn" title="${esc(q.conflict_note)}">多机不一致</span>`);
+    // 重置时间只在它是未来时才有意义
+    if (q.reset_at_ms && q.reset_at_ms > Date.now()) {
+      tags.push(`<span class="tag">${esc(fmtTime(q.reset_at_ms))}重置</span>`);
+    }
+    const apps = [...(q.apps || [q.app_type])].join(' / ');
+    // 套餐类 remaining=0 且 total=0 说明这个账号根本没有该套餐，别当「余额 0」吓人
+    const noPlan = q.unit === 'requests' && q.total === 0 && q.remaining === 0;
+    const numText = noPlan ? '<span class="win">无套餐额度</span>' : fmtNum(q.remaining, q.unit);
+    const totalText = (!noPlan && q.total) ? `<span class="win"> / ${fmtNum(q.total, q.unit)}</span>` : '';
+
+    html.push(`<div class="quota ${q.stale ? 'stale' : ''}">
+        <div class="name"><span>${esc(q.provider_label)}</span>
+          <span class="win">${esc(windowLabel(q.window_key))}</span></div>
+        <div class="num">${numText}${totalText}</div>
+        ${pct != null && !noPlan ? `<div class="bar-wrap"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>` : ''}
+        <div class="meta">${esc(apps)}　观测 ${esc(fmtTime(q.observed_at_ms))}${tags.length ? ' ' + tags.join(' ') : ''}</div>
+      </div>`);
   }
   el.innerHTML = html.join('');
 }
