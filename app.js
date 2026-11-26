@@ -3,11 +3,6 @@
  * AI 用量前端。两种部署模式共用同一套代码：
  *   - server：从 /api/* 取数
  *   - static：读 data/ 下的预生成文件，在浏览器里解密并合并各机器数据
- *
- * 展示原则（用户明确要求）：数据是给人看的，不是抓到了就全列出来。
- *   - 今天的数字放最前，因为它是最常被问的
- *   - 空值 / 无意义的条目直接不显示，而不是显示 0 或「无数据」
- *   - 数字按量级缩写（1.2K / 3.4M / 5.6B），不丢有效位数
  */
 
 const state = {
@@ -15,11 +10,10 @@ const state = {
   encrypted: false,
   snapshotMs: 0,
   days: 30,        // 0 = 全部
-  summary: null,
-  quotas: [],
-  machines: [],
-  accountsExpanded: false,
-  modelsExpanded: false,
+  data: null,
+  view: 'models',
+  expanded: false,
+  refreshId: 0,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -196,7 +190,7 @@ async function loadJSON(path) {
 }
 
 /** 口令门：等用户在页面上输入 */
-function askPassphrase() {
+function askPassphrase(message = '') {
   return new Promise((resolve) => {
     document.body.classList.add('locked');
     const panel = $('#unlock');
@@ -204,7 +198,7 @@ function askPassphrase() {
     const input = $('#pass');
     const msg = $('#unlock-msg');
     panel.hidden = false;
-    msg.textContent = '';
+    msg.textContent = message;
     input.value = '';
     setTimeout(() => input.focus(), 50);
 
@@ -229,27 +223,13 @@ async function loadStaticData() {
 
   const rows = [];
   const quotas = [];
-  const machines = [];
 
   for (const m of index.machines || []) {
     const raw = await loadJSON('./data/' + m.file);
-    let doc;
+    let doc = raw;
     if (index.encrypted) {
       if (!staticPass) staticPass = await askPassphrase();
-      try {
-        doc = await decryptJSON(raw, staticPass);
-      } catch {
-        staticData = null;
-        staticPass = null;
-        document.body.classList.add('locked');
-        $('#unlock').hidden = false;
-        $('#unlock-msg').textContent = '口令不正确，请重试。';
-        $('#pass').value = '';
-        $('#pass').focus();
-        throw new Error('口令不正确');
-      }
-    } else {
-      doc = raw;
+      doc = await decryptJSON(raw, staticPass);
     }
 
     const label = doc.machine_label || String(doc.machine_id).slice(0, 8);
@@ -262,10 +242,9 @@ async function loadStaticData() {
       });
     }
     for (const q of doc.quotas || []) quotas.push(q);
-    machines.push({ machine_id: doc.machine_id, label, last_seen_ms: doc.generated_at_ms });
   }
 
-  staticData = { rows, quotas, machines, snapshotMs: index.generated_at_ms };
+  staticData = { rows, quotas, snapshotMs: index.generated_at_ms };
   return staticData;
 }
 
@@ -296,96 +275,34 @@ function groupBy(rows, keyFn, labelFn) {
   return [...m.values()].sort((a, b) => b.cost_micro_usd - a.cost_micro_usd);
 }
 
-// ---------- 渲染：今天 ----------
-
-function renderToday(allRows) {
-  const today = dayKey(new Date());
-  const yest = daysAgoKey(1);
-
-  const t = emptyAgg();
-  let tRows = 0;
-  for (const r of allRows) if (r.date === today) { addInto(t, r); tRows++; }
-
-  const y = emptyAgg();
-  for (const r of allRows) if (r.date === yest) addInto(y, r);
-
-  $('#today-cost').textContent = tRows ? fmtUSD(t.cost_micro_usd) : '—';
-
-  const okRate = t.request_count > 0
-    ? (t.success_count / t.request_count * 100).toFixed(1)
-    : null;
-
-  $('#today-sub').innerHTML = tRows
-    ? `<span class="num">${fmtInt(t.request_count)}</span> 次请求` +
-      (okRate ? `　成功 <span class="num">${okRate}%</span>` : '') +
-      `　<span class="num">${fmtInt(t.input_tokens + t.output_tokens)}</span> tokens`
-    : '今天还没有用量';
-
-  // 与昨天同期对比
-  const side = [];
-  if (tRows && y.request_count > 0) {
-    const diff = t.cost_micro_usd - y.cost_micro_usd;
-    const pct = y.cost_micro_usd > 0 ? (diff / y.cost_micro_usd) * 100 : 0;
-    const cls = diff > 0 ? 'delta-up' : diff < 0 ? 'delta-down' : '';
-    const arrow = diff > 0 ? '↑' : diff < 0 ? '↓' : '→';
-    side.push(`<div><div class="k">对比昨天</div>
-      <div class="v ${cls}">${arrow} ${Math.abs(pct).toFixed(0)}%</div></div>`);
-    side.push(`<div><div class="k">昨天</div>
-      <div class="v num">${fmtUSD(y.cost_micro_usd)}</div></div>`);
-  }
-  if (t.request_count > 0) {
-    side.push(`<div><div class="k">今日 token</div>
-      <div class="v num">${fmtInt(t.input_tokens + t.output_tokens)}</div></div>`);
-  }
-  $('#today-side').innerHTML = side.join('');
-}
-
-// ---------- 渲染：KPI ----------
-
 function renderKpis(total) {
-  const okRate = total.request_count > 0
-    ? (total.success_count / total.request_count * 100).toFixed(1) + '%'
-    : null;
-  const cacheBase = total.input_tokens + total.cache_read_tokens;
-  const cacheHit = cacheBase > 0 ? (total.cache_read_tokens / cacheBase * 100).toFixed(0) + '%' : null;
-
   const items = [
-    ['总花费', fmtUSD(total.cost_micro_usd), '统一价格表重算'],
-    ['请求', fmtInt(total.request_count), okRate ? `成功 ${okRate}` : ''],
-    ['输入', fmtInt(total.input_tokens), total.output_tokens ? `输出 ${fmtInt(total.output_tokens)}` : ''],
-    ['缓存读取', fmtInt(total.cache_read_tokens), cacheHit ? `占比 ${cacheHit}` : ''],
-    ['缓存写入', fmtInt(total.cache_creation_tokens), ''],
+    ['总花费', fmtUSD(total.cost_micro_usd)],
+    ['请求次数', fmtInt(total.request_count)],
+    ['输入 Token', fmtInt(total.input_tokens)],
+    ['输出 Token', fmtInt(total.output_tokens)],
   ];
-
-  $('#kpis').innerHTML = items
-    // 值为 0 且没有补充说明的，不占位
-    .filter(([, v, s]) => v !== '0' && v !== '—' || s)
-    .map(([k, v, s]) => `<div class="kpi">
-        <div class="k">${esc(k)}</div>
-        <div class="v num">${esc(v)}</div>
-        ${s ? `<div class="s">${esc(s)}</div>` : ''}
-      </div>`).join('');
+  $('#kpis').innerHTML = items.map(([label, value]) => `<div class="kpi">
+    <div class="k">${label}</div>
+    <div class="v num">${value}</div>
+  </div>`).join('');
 }
 
 // ---------- 渲染：图表 ----------
 
-function renderChart(days, windowDays) {
+function renderChart(days) {
   const el = $('#chart');
   const series = days.slice().sort((a, b) => a.key.localeCompare(b.key));
 
-  let note = '';
-  if (windowDays === 1) {
-    note = '最近 14 天，今天高亮';
-  } else if (series.length > 1) {
-    note = `${series.length} 天`;
-  }
-
+  $('#chart-note').textContent = series.length ? `${series.length} 天有用量` : '';
   if (!series.length) {
     el.innerHTML = '<div class="empty">这段时间没有用量</div>';
-    $('#chart-note').textContent = '';
     return;
   }
-  $('#chart-note').textContent = note;
+  if (!series.some((day) => day.cost_micro_usd > 0)) {
+    el.innerHTML = '<div class="empty">这段时间没有可显示的花费</div>';
+    return;
+  }
 
   const today = dayKey(new Date());
   // 窄屏用更小的画布，保证柱子不会被压得太细
@@ -404,7 +321,7 @@ function renderChart(days, windowDays) {
     const h = Math.max(0.8, ((d.cost_micro_usd || 0) / max) * ih);
     const y = padT + ih - h;
     const isToday = d.key === today;
-    return `<rect class="bar${isToday ? ' today' : ''}" x="${x.toFixed(1)}" y="${y.toFixed(1)}"
+    return `<rect class="chart-bar${isToday ? ' today' : ''}" x="${x.toFixed(1)}" y="${y.toFixed(1)}"
       width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="${Math.min(2.5, bw / 3).toFixed(1)}">
       <title>${esc(d.key)}　${fmtUSD(d.cost_micro_usd)}　${fmtInt(d.request_count)} 次</title></rect>`;
   }).join('');
@@ -448,13 +365,12 @@ function windowLabel(w) {
 }
 
 function renderQuotas(quotas) {
-  const el = $('#quotas');
+  const el = $('#details');
 
-  // 同一份额度会在多个应用/多个域名上报多条，按「账号名 + 窗口」收敛
-  const nameOf = (k) => String(k || '').split('|').slice(2).join('|').trim();
+  // 同一账号的同一种额度只显示最新的快照。
   const merged = new Map();
   for (const q of quotas) {
-    const key = `${nameOf(q.account_key)}\u0000${q.window_key}`;
+    const key = `${q.usage_account_key || q.account_key}\u0000${q.window_key}`;
     const prev = merged.get(key);
     if (!prev) {
       merged.set(key, { ...q, apps: new Set([q.app_type]) });
@@ -480,8 +396,7 @@ function renderQuotas(quotas) {
 
   if (!meaningful.length) {
     el.innerHTML = `<div class="empty">
-      没有可显示额度<br>
-      <span style="font-size:12px">供应商的额度查询没配置，或该账号没有余额信息</span>
+      此时段有用量的账号暂无可显示的额度
     </div>`;
     return;
   }
@@ -502,7 +417,7 @@ function renderQuotas(quotas) {
     return String(a.provider_label).localeCompare(String(b.provider_label));
   });
 
-  el.innerHTML = meaningful.map((q) => {
+  const cards = meaningful.map((q) => {
     const pct = (q.remaining != null && q.total)
       ? Math.max(0, Math.min(100, q.remaining / q.total * 100))
       : null;
@@ -527,171 +442,339 @@ function renderQuotas(quotas) {
       <div class="quota-meta"><span>${esc(apps)}</span><span>${esc(fmtAgo(q.observed_at_ms))}</span>${tags.join('')}</div>
     </div>`;
   }).join('');
+  el.innerHTML = `<p class="detail-note">显示时段内有用量的账号，余额为最近一次采集值。</p>
+    <div class="quotas">${cards}</div>`;
 }
 
 // ---------- 渲染：排行列表 ----------
 
-function renderRows(el, rows, opts = {}) {
-  const { expanded = false, limit = 8, onToggle = null, unit = 'cost' } = opts;
-  if (!rows || !rows.length) {
-    el.innerHTML = '<div class="empty">无数据</div>';
+function renderDetails() {
+  if (!state.data) return;
+  const { summary, quotas } = state.data;
+  if (state.view === 'quotas') {
+    const accounts = new Set((summary.accounts || []).map((row) => row.key));
+    renderQuotas(quotas.filter((quota) => accounts.has(quota.usage_account_key || quota.account_key)));
     return;
   }
 
-  const max = Math.max(...rows.map((r) => r.cost_micro_usd || 0), 1);
-  const shown = expanded ? rows : rows.slice(0, limit);
-
-  const head = `<div class="row-head">
-    <span>名称</span><span>花费</span><span>请求</span><span>输入</span><span>输出</span><span>缓存</span>
-  </div>`;
-
-  const body = shown.map((r) => {
-    const w = Math.max(1, Math.round((r.cost_micro_usd / max) * 100));
-    return `<div class="row">
-      <div class="row-name" title="${esc(r.label)}">${esc(r.label)}</div>
-      <div class="row-cost">${fmtUSD(r.cost_micro_usd)}</div>
-      <div class="row-meta">
-        <span class="bar-mini"><i style="width:${w}%"></i></span>
-        <span class="req">${fmtInt(r.request_count)} 次</span>
-        <span class="in">${fmtInt(r.input_tokens)}</span>
-        <span class="out">${fmtInt(r.output_tokens)}</span>
-        <span class="cache">${fmtInt(r.cache_read_tokens)}</span>
-      </div>
-    </div>`;
-  }).join('');
-
-  const more = rows.length > limit
-    ? `<button type="button" class="row more" data-toggle>
-        ${expanded ? '收起' : `还有 ${rows.length - limit} 项`}
-      </button>`
-    : '';
-
-  el.innerHTML = head + body + more;
-
-  if (onToggle) {
-    const b = el.querySelector('[data-toggle]');
-    if (b) b.addEventListener('click', onToggle);
+  const tokens = state.view === 'tokens';
+  const rows = summary[tokens ? 'models' : state.view] || [];
+  const el = $('#details');
+  if (rows.length === 0) {
+    el.innerHTML = '<div class="empty">这段时间没有用量</div>';
+    return;
   }
-}
 
-// ---------- 主流程 ----------
-
-function setFoot() {
-  const bits = [];
-  if (state.mode === 'static') {
-    bits.push(`数据截至 ${fmtClock(state.snapshotMs)}（${fmtAgo(state.snapshotMs)}）`);
-    bits.push('每日自动更新');
-  } else {
-    bits.push('自建服务 · 实时');
-  }
-  bits.push('不含任何凭据');
-  $('#foot').textContent = bits.join(' · ');
+  const name = { models: '模型', accounts: '账号', machines: '设备', tokens: '模型' }[state.view];
+  const columns = tokens
+    ? [['输入', 'input_tokens'], ['输出', 'output_tokens'], ['缓存读取', 'cache_read_tokens'], ['缓存写入', 'cache_creation_tokens']]
+    : [['请求次数', 'request_count'], ['花费', 'cost_micro_usd', fmtUSD]];
+  const shown = state.expanded ? rows : rows.slice(0, 6);
+  el.innerHTML = `<div class="table-scroll" role="region" aria-label="${name}用量" tabindex="0">
+    <table class="usage-table">
+      <thead><tr><th scope="col">${name}</th>${columns.map(([label]) => `<th scope="col">${label}</th>`).join('')}</tr></thead>
+      <tbody>${shown.map((row) => `<tr>
+        <th scope="row">${esc(row.label || row.key || '未知')}</th>
+        ${columns.map(([label, key, format = fmtInt]) => `<td class="num"><span class="mobile-field" aria-hidden="true">${label}</span>${format(row[key] || 0)}</td>`).join('')}
+      </tr>`).join('')}</tbody>
+    </table>
+  </div>${rows.length > 6 ? `<button type="button" class="show-more" aria-expanded="${state.expanded}">
+    ${state.expanded ? '收起' : `查看全部 ${rows.length} 项`}</button>` : ''}`;
+  el.querySelector('.show-more')?.addEventListener('click', () => {
+    state.expanded = !state.expanded;
+    renderDetails();
+    el.querySelector('.show-more')?.focus();
+  });
 }
 
 async function refresh() {
-  try {
-    let summary; let quotas; let machines; let allRows;
+  const refreshId = ++state.refreshId;
+  const from = state.days ? daysAgoKey(state.days - 1) : '0001-01-01';
+  const to = dayKey(new Date());
+  const dashboard = $('#dashboard');
+  dashboard.setAttribute('aria-busy', 'true');
+  $('#open-share').disabled = true;
 
+  try {
+    let summary;
+    let quotas;
+    let stats;
     if (state.mode === 'static') {
-      const d = await loadStaticData();
-      allRows = d.rows;
-      quotas = d.quotas;
-      machines = d.machines;
-      state.snapshotMs = d.snapshotMs;
+      const data = await loadStaticData();
+      const rows = data.rows.filter((row) => row.date >= from && row.date <= to);
+      const total = emptyAgg();
+      for (const row of rows) addInto(total, row);
+      summary = {
+        total,
+        days: groupBy(rows, (r) => r.date, (r) => r.date),
+        accounts: groupBy(rows, (r) => r.account_key, (r) => r.provider_label || r.account_key),
+        models: groupBy(rows, (r) => r.model, (r) => r.model),
+        machines: groupBy(rows, (r) => r.machine_id, (r) => r.machine_label),
+      };
+      quotas = data.quotas;
+      state.snapshotMs = data.snapshotMs;
     } else {
-      const days = state.days || 3650;
-      const from = daysAgoKey(days);
-      const to = dayKey(new Date());
-      const [s, q, m] = await Promise.all([
+      const [usage, quotaData, serverStats] = await Promise.all([
         loadJSON(`/api/summary?from=${from}&to=${to}`),
         loadJSON('/api/quotas'),
-        loadJSON('/api/machines'),
+        loadJSON('/api/stats'),
       ]);
-      summary = s;
-      quotas = q.quotas || [];
-      machines = m.machines || [];
-      // server 模式没有原始行，用分组结果直接展示
-      allRows = null;
-      state.snapshotMs = Date.now();
+      summary = usage;
+      quotas = quotaData.quotas || [];
+      stats = serverStats;
     }
 
-    if (allRows) {
-      const from = state.days ? daysAgoKey(state.days) : '0000-00-00';
-      const inRange = allRows.filter((r) => r.date >= from);
+    if (refreshId !== state.refreshId) return;
+    $('#onboarding').hidden = !stats || stats.usage_rows > 0;
+    $('#local-sync').hidden = !stats?.local_sync;
+    $('#local-setup').hidden = !stats?.local_sync;
+    $('#manual-setup').hidden = !!stats?.local_sync;
 
-      // 今天与 KPI 用全量行算，不受范围影响
-      renderToday(allRows);
-
-      const total = emptyAgg();
-      for (const r of inRange) addInto(total, r);
-      renderKpis(total);
-
-      // 选「今天」时，范围里只有一天，图表没有趋势可看 → 改画最近 14 天
-      const chartSrc = state.days === 1
-        ? allRows.filter((r) => r.date >= daysAgoKey(13))
-        : inRange;
-      const chartDays = groupBy(chartSrc, (r) => r.date, (r) => r.date)
-        .sort((a, b) => a.key.localeCompare(b.key));
-      renderChart(chartDays, state.days);
-
-      renderRows($('#accounts'), groupBy(inRange, (r) => r.account_key, (r) => r.provider_label || r.account_key),
-        { expanded: state.accountsExpanded, onToggle: () => { state.accountsExpanded = !state.accountsExpanded; refresh(); } });
-      renderRows($('#models'), groupBy(inRange, (r) => r.model, (r) => r.model),
-        { expanded: state.modelsExpanded, onToggle: () => { state.modelsExpanded = !state.modelsExpanded; refresh(); } });
-
-      const mrows = groupBy(inRange, (r) => r.machine_id, (r) => r.machine_label);
-      $('#machines-panel').hidden = mrows.length <= 1;
-      if (mrows.length > 1) renderRows($('#machines'), mrows, {});
-    } else {
-      // server 模式：后端已聚合好
-      renderTodayFallback(summary);
-      renderKpis(summary.total || {});
-      renderChart(summary.days || [], state.days);
-      renderRows($('#accounts'), summary.accounts || []);
-      renderRows($('#models'), summary.models || []);
-      const mrows = summary.machines || [];
-      $('#machines-panel').hidden = mrows.length <= 1;
-      if (mrows.length > 1) renderRows($('#machines'), mrows, {});
+    const firstDay = state.days ? from : (summary.days || []).reduce(
+      (first, day) => first === '' || day.key < first ? day.key : first, '');
+    $('#range-context').textContent = firstDay && firstDay !== to ? `${firstDay} 至 ${to}`
+      : firstDay || '全部时间';
+    state.data = { summary, quotas, period: $('#range-context').textContent, endDate: to };
+    renderKpis(summary.total || emptyAgg());
+    renderChart(summary.days || []);
+    renderDetails();
+    $('#foot').textContent = state.mode === 'static' && state.snapshotMs
+      ? `数据截至 ${fmtClock(state.snapshotMs)}` : '';
+    return stats;
+  } catch (error) {
+    if (refreshId !== state.refreshId) return;
+    console.error(error);
+    if (state.encrypted && error.name === 'OperationError') {
+      document.body.classList.add('locked');
+      staticPass = await askPassphrase('无法解密，请检查口令后重试。');
+      return refresh();
     }
-
-    renderQuotas(quotas);
-    setFoot();
-  } catch (e) {
-    console.error(e);
-    $('#today-cost').textContent = '—';
-    $('#today-sub').textContent = '加载失败：' + e.message;
+    state.data = null;
+    $('#range-context').textContent = `用量加载失败，请刷新页面。(${error.message})`;
+    $('#kpis').replaceChildren();
+    $('#details').replaceChildren();
+    $('#chart').replaceChildren();
+    $('#chart-note').textContent = '';
+  } finally {
+    if (refreshId === state.refreshId) {
+      dashboard.setAttribute('aria-busy', 'false');
+      $('#open-share').disabled = !state.data?.summary.days?.length;
+    }
   }
 }
 
-/** server 模式下没有原始行，用今天这一天的汇总近似渲染 */
-function renderTodayFallback(summary) {
-  const days = (summary.days || []).slice().sort((a, b) => a.key.localeCompare(b.key));
-  const today = dayKey(new Date());
-  const t = days.find((d) => d.key === today);
-  $('#today-cost').textContent = t ? fmtUSD(t.cost_micro_usd) : '—';
-  $('#today-sub').innerHTML = t
-    ? `<span class="num">${fmtInt(t.request_count)}</span> 次请求　<span class="num">${fmtInt(t.input_tokens + t.output_tokens)}</span> tokens`
-    : '今天还没有用量';
-  $('#today-side').innerHTML = '';
-  $('#chart-note').textContent = days.length > 1 ? `${days.length} 天` : '';
+async function syncLocalUsage() {
+  const button = $('#local-sync');
+  const status = $('#sync-status');
+  button.disabled = true;
+  status.hidden = false;
+  status.textContent = '正在读取并同步本机用量…';
+  try {
+    const response = await fetch('/api/local-sync', { method: 'POST' });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.message || '同步失败，请重试。');
+    const stats = await selectRange($('#range-tabs [data-days="0"]'));
+    status.textContent = !stats ? '同步完成。看板暂时加载失败，请刷新页面。'
+      : stats.usage_rows > 0 ? '同步完成，已切换到「全部」查看历史用量。'
+        : '本机还没有可导入的用量。产生用量后可以再次同步。';
+  } catch (error) {
+    status.textContent = error.message;
+    await refresh();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectRange(button) {
+  $$('#range-tabs button').forEach((btn) => {
+    btn.classList.toggle('on', btn === button);
+    btn.setAttribute('aria-pressed', String(btn === button));
+  });
+  state.days = Number(button.dataset.days);
+  state.expanded = false;
+  $('#range-context').textContent = '正在加载用量…';
+  return refresh();
 }
 
 function bindTabs() {
   $$('#range-tabs button').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      $$('#range-tabs button').forEach((b) => {
-        b.classList.toggle('on', b === btn);
-        b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
-      });
-      state.days = Number(btn.dataset.days);
-      state.accountsExpanded = false;
-      state.modelsExpanded = false;
-      refresh();
+    btn.addEventListener('click', () => selectRange(btn));
+  });
+  const detailButtons = $$('#detail-nav button');
+  detailButtons.forEach((button) => {
+    button.addEventListener('click', () => {
+      if (state.view === button.dataset.view) return;
+      state.view = button.dataset.view;
+      state.expanded = false;
+      detailButtons.forEach((btn) => btn.setAttribute('aria-pressed', String(btn === button)));
+      renderDetails();
     });
+  });
+  if (state.mode === 'server') {
+    setInterval(() => {
+      if ($('#dashboard').getAttribute('aria-busy') === 'false') refresh();
+    }, 30000);
+  }
+}
+
+const posterThemes = {
+  iris: { background: '#140e23', paper: '#f7eefc', muted: '#cdbdde', accent: '#d9b8ff' },
+  mint: { background: '#102721', paper: '#eff8ed', muted: '#b5d2c6', accent: '#a7f0c8' },
+  sunset: { background: '#2d171d', paper: '#fff1e8', muted: '#e6c0b4', accent: '#ffbf9d' },
+};
+
+function drawPoster(canvas, { summary, period }, theme, includeCost, artwork) {
+  const ctx = canvas.getContext('2d');
+  const { width, height } = canvas;
+  const palette = posterThemes[theme];
+  ctx.fillStyle = palette.background;
+  ctx.fillRect(0, 0, width, height);
+
+  if (artwork) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'screen';
+    ctx.globalAlpha = 0.77;
+    ctx.drawImage(artwork, 390, -12, 730, 730);
+    ctx.restore();
+    const feather = ctx.createLinearGradient(390, 0, 635, 0);
+    feather.addColorStop(0, palette.background);
+    feather.addColorStop(1, palette.background + '00');
+    ctx.fillStyle = feather;
+    ctx.fillRect(390, 0, 245, 718);
+  }
+  const shade = ctx.createLinearGradient(0, 265, 0, 730);
+  shade.addColorStop(0, palette.background + '00');
+  shade.addColorStop(1, palette.background);
+  ctx.fillStyle = shade;
+  ctx.fillRect(0, 265, width, 465);
+
+  function text(value, x, y, size, { weight = 500, color = palette.paper, serif = false, maxWidth = width - x - 86 } = {}) {
+    const family = serif ? 'Georgia, "Songti SC", "Noto Serif CJK SC", serif'
+      : 'system-ui, "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.font = `${weight} ${size}px ${family}`;
+    ctx.fillStyle = color;
+    ctx.fillText(value, x, y, maxWidth);
+  }
+
+  function rule(y) {
+    ctx.fillStyle = palette.muted + '55';
+    ctx.fillRect(86, y, 908, 2);
+  }
+
+  const total = summary.total || emptyAgg();
+  const days = summary.days.slice().sort((a, b) => a.key.localeCompare(b.key));
+  text('我的 AI 使用记录', 86, 146, 60, { serif: true, weight: 600 });
+  text(period.replaceAll('-', '.'), 88, 206, 30, { color: palette.muted });
+
+  text(fmtInt(total.request_count), 74, 510, 212, { serif: true, maxWidth: 890 });
+  text('次请求', 89, 581, 42, { color: palette.accent });
+  rule(650);
+
+  const metrics = [
+    ['输入 Token', fmtInt(total.input_tokens)],
+    ['输出 Token', fmtInt(total.output_tokens)],
+  ];
+  metrics.forEach(([label, value], index) => {
+    const x = 87 + index * 470;
+    text(label, x, 726, 32, { color: palette.muted });
+    text(value, x, 816, 69, { serif: true, maxWidth: 425 });
+  });
+  if (includeCost) text(`总花费  ${fmtUSD(total.cost_micro_usd)}`, 88, 888, 34, { color: palette.accent });
+
+  const sectionTop = includeCost ? 929 : 885;
+  rule(sectionTop);
+  text('每日请求', 87, sectionTop + 64, 36, { weight: 600 });
+  text(`${days.length} 天有记录`, 780, sectionTop + 62, 28, { color: palette.muted });
+
+  const chartLeft = 88;
+  const chartRight = 992;
+  const chartBottom = 1260;
+  const chartHeight = chartBottom - sectionTop - 104;
+  const first = Date.parse(days[0].key);
+  const span = Math.round((Date.parse(days[days.length - 1].key) - first) / 86400000) + 1;
+  const step = (chartRight - chartLeft) / span;
+  const max = days.reduce((highest, day) => Math.max(highest, day.request_count), 1);
+  for (const ratio of [0, 0.5, 1]) rule(chartBottom - chartHeight * ratio);
+
+  const gradient = ctx.createLinearGradient(0, chartBottom - chartHeight, 0, chartBottom);
+  gradient.addColorStop(0, palette.accent);
+  gradient.addColorStop(1, palette.accent + '64');
+  ctx.fillStyle = gradient;
+  const barWidth = Math.max(1, Math.min(32, step * 0.72));
+  for (const day of days) {
+    const offset = (Date.parse(day.key) - first) / 86400000;
+    const x = chartLeft + step * (offset + 0.5) - barWidth / 2;
+    const barHeight = day.request_count / max * chartHeight;
+    ctx.fillRect(x, chartBottom - barHeight, barWidth, barHeight);
+  }
+  text(days[0].key.slice(5).replace('-', '.'), 88, 1314, 27, { color: palette.muted });
+  if (days.length > 1) {
+    ctx.textAlign = 'right';
+    text(days[days.length - 1].key.slice(5).replace('-', '.'), 992, 1314, 27,
+      { color: palette.muted, maxWidth: 200 });
+    ctx.textAlign = 'left';
+  }
+}
+
+function bindShareControls() {
+  const picker = $('#theme-picker');
+  const dialog = $('#share-dialog');
+  const cost = $('#include-cost');
+  const nativeShare = $('#native-share');
+  const preview = $('#share-preview');
+  const save = $('#save-poster');
+  const canvas = document.createElement('canvas');
+  canvas.width = 1080;
+  canvas.height = 1440;
+  let snapshot;
+  let file;
+  const artwork = new Image();
+  artwork.src = './usage-cover.webp';
+
+  try {
+    const saved = localStorage.getItem('usage-theme');
+    if (Object.hasOwn(posterThemes, saved)) picker.value = saved;
+  } catch { /* 浏览器可能禁用本地存储 */ }
+  document.documentElement.dataset.theme = picker.value;
+  picker.addEventListener('change', () => {
+    document.documentElement.dataset.theme = picker.value;
+    try { localStorage.setItem('usage-theme', picker.value); } catch { /* 仅在本次页面生效 */ }
+  });
+
+  const updatePoster = () => {
+    drawPoster(canvas, snapshot, picker.value, cost.checked, artwork.naturalWidth ? artwork : null);
+    const data = canvas.toDataURL('image/png');
+    const filename = `AI-用量-${snapshot.endDate}.png`;
+    preview.src = data;
+    save.href = data;
+    save.download = filename;
+    file = new File([b64ToBytes(data.split(',')[1])], filename, { type: 'image/png' });
+    nativeShare.hidden = !navigator.canShare?.({ files: [file] });
+  };
+  $('#open-share').addEventListener('click', () => {
+    if (!state.data?.summary.days?.length) return;
+    snapshot = state.data;
+    updatePoster();
+    dialog.showModal();
+  });
+  artwork.addEventListener('load', () => {
+    if (dialog.open) updatePoster();
+  });
+  cost.addEventListener('change', updatePoster);
+  nativeShare.addEventListener('click', async () => {
+    try {
+      await navigator.share({ files: [file], title: '我的 AI 用量' });
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        nativeShare.hidden = true;
+        save.focus();
+      }
+    }
   });
 }
 
 async function boot() {
+  bindShareControls();
   // 判定模式：存在 data/index.json 且 mode=static 就是静态站
   try {
     const res = await fetch('./data/index.json', { cache: 'no-store' });
@@ -705,9 +788,9 @@ async function boot() {
     }
   } catch { /* 没有清单就是 server 模式 */ }
 
-  bindTabs();
-  $('#admin-panel').hidden = true;
   await refresh();
+  bindTabs();
+  $('#local-sync').addEventListener('click', syncLocalUsage);
 }
 
 boot();

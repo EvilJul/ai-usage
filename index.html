@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
 <title>AI 用量</title>
-<link rel="stylesheet" href="./style.css?v=bdf1bfad">
+<link rel="stylesheet" href="./style.css?v=4bd544dd">
 </head>
 <body>
 
@@ -29,79 +29,93 @@
 <header class="bar">
   <div class="bar-inner">
     <h1 class="brand">AI 用量</h1>
-    <nav class="tabs" id="range-tabs" role="tablist" aria-label="时间范围">
-      <button type="button" role="tab" data-days="1">今天</button>
-      <button type="button" role="tab" data-days="7">7 天</button>
-      <button type="button" role="tab" data-days="30" aria-selected="true" class="on">30 天</button>
-      <button type="button" role="tab" data-days="0">全部</button>
+    <button type="button" class="sync-button" id="local-sync" hidden>同步本机用量</button>
+    <nav class="tabs" id="range-tabs" aria-label="时间范围">
+      <button type="button" data-days="1" aria-pressed="false">今天</button>
+      <button type="button" data-days="7" aria-pressed="false">7 天</button>
+      <button type="button" data-days="30" aria-pressed="true" class="on">30 天</button>
+      <button type="button" data-days="0" aria-pressed="false">全部</button>
     </nav>
   </div>
 </header>
 
 <main>
 
-  <!-- 今天：最重要的数字放最前 -->
-  <section class="today" id="today-block">
-    <div class="today-main">
-      <div class="today-label">今天</div>
-      <div class="today-cost" id="today-cost">—</div>
-      <div class="today-sub" id="today-sub"></div>
+  <p class="sync-status" id="sync-status" role="status" hidden></p>
+  <section class="panel onboarding" id="onboarding" hidden>
+    <h2>开始记录 AI 用量</h2>
+    <p id="local-setup" hidden>还没有用量数据。点击上方「同步本机用量」，导入这台电脑上的 cc-switch 历史记录。</p>
+    <div id="manual-setup">
+    <p>还没有收到采集端的数据。按下面三步连接采集端。</p>
+    <ol>
+      <li>启动服务时配置 ingest token 文件。</li>
+      <li>在采集端运行 <code>node --experimental-sqlite src/index.js init</code>，填写 <code>http://127.0.0.1:8787/v1/ingest</code> 和同一个 token。</li>
+      <li>先运行 <code>node --experimental-sqlite src/index.js scan</code>，确认扫描通过，再运行 <code>node --experimental-sqlite src/index.js backfill</code>。</li>
+    </ol>
+    <p class="hint">同一台 Mac 上使用时，可双击仓库里的「启动用量看板.command」，使用一键同步。</p>
     </div>
-    <div class="today-side" id="today-side"></div>
   </section>
 
-  <section class="kpis" id="kpis"></section>
+  <div id="dashboard" aria-busy="true">
+    <section class="overview" aria-labelledby="overview-title">
+      <div class="overview-hero">
+        <h2 id="overview-title">我的 AI 用量</h2>
+        <p id="range-context" class="range-context" role="status">正在加载用量…</p>
+        <div class="overview-actions">
+          <label class="theme-picker">主题
+            <select id="theme-picker">
+              <option value="iris">星夜紫</option>
+              <option value="mint">薄荷绿</option>
+              <option value="sunset">落日橙</option>
+            </select>
+          </label>
+          <button type="button" class="share-button" id="open-share" disabled>生成分享图</button>
+        </div>
+      </div>
+      <div class="kpis" id="kpis"></div>
+    </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>每日花费</h2>
-      <span class="panel-note" id="chart-note"></span>
-    </div>
-    <div class="chart" id="chart"></div>
-  </section>
+    <section class="panel trend-panel" aria-labelledby="trend-title">
+      <div class="panel-head">
+        <h2 id="trend-title">花费趋势</h2>
+        <span class="panel-note" id="chart-note"></span>
+      </div>
+      <div class="chart" id="chart"></div>
+    </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>剩余额度</h2>
-    </div>
-    <p class="hint">额度按<b>账号</b>算，不是按设备。同一账号在多台机器上只显示一条。</p>
-    <div class="quotas" id="quotas"></div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <h2>账号</h2>
-      <span class="panel-note">按花费排序</span>
-    </div>
-    <div id="accounts"></div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <h2>模型</h2>
-      <span class="panel-note">按花费排序</span>
-    </div>
-    <div id="models"></div>
-  </section>
-
-  <section class="panel" id="machines-panel" hidden>
-    <div class="panel-head">
-      <h2>设备</h2>
-      <span class="panel-note">用量按设备相加</span>
-    </div>
-    <div id="machines"></div>
-  </section>
-
-  <section class="panel" id="admin-panel" hidden>
-    <div class="panel-head"><h2>账号管理</h2></div>
-    <p class="hint">同一账号在不同机器上名字不同时，合并到一个账号下。只改归属，不改历史。</p>
-    <div id="admin"></div>
-  </section>
+    <section class="panel details-panel" aria-labelledby="details-title">
+      <div class="panel-head"><h2 id="details-title">用量明细</h2></div>
+      <nav class="detail-nav" id="detail-nav" aria-label="明细视图">
+        <button type="button" data-view="models" aria-pressed="true">模型</button>
+        <button type="button" data-view="accounts" aria-pressed="false">账号</button>
+        <button type="button" data-view="tokens" aria-pressed="false">Token</button>
+        <button type="button" data-view="quotas" aria-pressed="false">额度</button>
+        <button type="button" data-view="machines" aria-pressed="false">设备</button>
+      </nav>
+      <div id="details"></div>
+    </section>
+  </div>
 
 </main>
 
 <footer id="foot"></footer>
 
-<script src="./app.js?v=40a61574"></script>
+<dialog id="share-dialog" class="share-dialog" aria-labelledby="share-title">
+  <div class="share-top" tabindex="-1" autofocus>
+    <h2 id="share-title">分享用量</h2>
+    <form method="dialog"><button type="submit" class="close-share" aria-label="关闭">×</button></form>
+  </div>
+  <div class="share-body">
+    <img id="share-preview" alt="当前时段的 AI 用量分享海报">
+  </div>
+  <div class="share-footer">
+    <label><input type="checkbox" id="include-cost"> 显示花费</label>
+    <button type="button" id="native-share" class="share-button" hidden>分享图片</button>
+    <a class="save-poster" id="save-poster" download>保存图片</a>
+    <p>保存图片后，在朋友圈选图发布。</p>
+  </div>
+</dialog>
+
+<script src="./app.js?v=24a61b49"></script>
 </body>
 </html>
