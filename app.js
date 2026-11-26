@@ -184,7 +184,10 @@ function costMicro(priceIdx, row) {
 
 async function loadJSON(path) {
   const url = state.mode === 'static' ? `${path}?t=${Math.floor(Date.now() / 300000)}` : path;
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
