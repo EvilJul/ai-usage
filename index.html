@@ -4,23 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
-<meta name="theme-color" content="#111317" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
-<title>AI 用量中心</title>
-<link rel="stylesheet" href="./style.css?v=b812f48a">
+<meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
+<title>AI 用量</title>
+<link rel="stylesheet" href="./style.css?v=4bd544dd">
 </head>
 <body>
 
+<!-- 加密站的口令门 -->
 <section class="gate" id="unlock" hidden>
   <div class="gate-inner">
-    <div class="gate-icon" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.8">
-        <rect x="4" y="11" width="16" height="10" rx="2"/>
-        <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
-      </svg>
-    </div>
-    <h1>需要查看口令</h1>
-    <p class="gate-hint">口令仅在当前浏览器内存用于解密，不会上传到任何服务器。</p>
+    <div class="gate-icon" aria-hidden="true">🔒</div>
+    <h1>已加密</h1>
+    <p class="gate-hint">输入查看口令。口令只在本机浏览器里用于解密，不会发送到任何地方。</p>
     <form id="unlock-form">
       <input type="password" id="pass" placeholder="查看口令" autocomplete="current-password"
              autocapitalize="off" autocorrect="off" spellcheck="false" required>
@@ -32,8 +28,7 @@
 
 <header class="bar">
   <div class="bar-inner">
-    <h1 class="brand">AI 用量中心</h1>
-    <span class="range-context num" id="range-context" role="status">正在加载…</span>
+    <h1 class="brand">AI 用量</h1>
     <button type="button" class="sync-button" id="local-sync" hidden>同步本机用量</button>
     <nav class="tabs" id="range-tabs" aria-label="时间范围">
       <button type="button" data-days="1" aria-pressed="false">今天</button>
@@ -45,25 +40,45 @@
 </header>
 
 <main>
+
   <p class="sync-status" id="sync-status" role="status" hidden></p>
   <section class="panel onboarding" id="onboarding" hidden>
     <h2>开始记录 AI 用量</h2>
-    <p id="local-setup" hidden>还没有用量数据。点击右上角「同步本机用量」导入这台电脑的 cc-switch 记录。</p>
+    <p id="local-setup" hidden>还没有用量数据。点击上方「同步本机用量」，导入这台电脑上的 cc-switch 历史记录。</p>
     <div id="manual-setup">
-      <p>还没有收到采集端的数据，请安装桌面端或配置采集端上传。</p>
+    <p>还没有收到采集端的数据。按下面三步连接采集端。</p>
+    <ol>
+      <li>启动服务时配置 ingest token 文件。</li>
+      <li>在采集端运行 <code>node --experimental-sqlite src/index.js init</code>，填写 <code>http://127.0.0.1:8787/v1/ingest</code> 和同一个 token。</li>
+      <li>先运行 <code>node --experimental-sqlite src/index.js scan</code>，确认扫描通过，再运行 <code>node --experimental-sqlite src/index.js backfill</code>。</li>
+    </ol>
+    <p class="hint">同一台 Mac 上使用时，可双击仓库里的「启动用量看板.command」，使用一键同步。</p>
     </div>
   </section>
 
   <div id="dashboard" aria-busy="true">
-    <section aria-labelledby="overview-title">
-      <h2 id="overview-title" class="sr-only">用量概览</h2>
+    <section class="overview" aria-labelledby="overview-title">
+      <div class="overview-hero">
+        <h2 id="overview-title">我的 AI 用量</h2>
+        <p id="range-context" class="range-context" role="status">正在加载用量…</p>
+        <div class="overview-actions">
+          <label class="theme-picker">主题
+            <select id="theme-picker">
+              <option value="iris">星夜紫</option>
+              <option value="mint">薄荷绿</option>
+              <option value="sunset">落日橙</option>
+            </select>
+          </label>
+          <button type="button" class="share-button" id="open-share" disabled>生成分享图</button>
+        </div>
+      </div>
       <div class="kpis" id="kpis"></div>
     </section>
 
     <section class="panel trend-panel" aria-labelledby="trend-title">
       <div class="panel-head">
         <h2 id="trend-title">花费趋势</h2>
-        <span class="panel-note num" id="chart-note"></span>
+        <span class="panel-note" id="chart-note"></span>
       </div>
       <div class="chart" id="chart"></div>
     </section>
@@ -80,10 +95,27 @@
       <div id="details"></div>
     </section>
   </div>
+
 </main>
 
 <footer id="foot"></footer>
 
-<script src="./app.js?v=c1195f79"></script>
+<dialog id="share-dialog" class="share-dialog" aria-labelledby="share-title">
+  <div class="share-top" tabindex="-1" autofocus>
+    <h2 id="share-title">分享用量</h2>
+    <form method="dialog"><button type="submit" class="close-share" aria-label="关闭">×</button></form>
+  </div>
+  <div class="share-body">
+    <img id="share-preview" alt="当前时段的 AI 用量分享海报">
+  </div>
+  <div class="share-footer">
+    <label><input type="checkbox" id="include-cost"> 显示花费</label>
+    <button type="button" id="native-share" class="share-button" hidden>分享图片</button>
+    <a class="save-poster" id="save-poster" download>保存图片</a>
+    <p>保存图片后，在朋友圈选图发布。</p>
+  </div>
+</dialog>
+
+<script src="./app.js?v=bbbf8959"></script>
 </body>
 </html>
