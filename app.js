@@ -1,15 +1,13 @@
 'use strict';
 /**
- * AI 用量前端。两种部署模式共用同一套代码：
- *   - server：从 /api/* 取数
- *   - static：读 data/ 下的预生成文件，在浏览器里解密并合并各机器数据
+ * AI 用量前端（支持自建服务端 mode=server 与静态加密站 mode=static）。
  */
 
 const state = {
   mode: 'server',
   encrypted: false,
   snapshotMs: 0,
-  days: 30,        // 0 = 全部
+  days: 30,
   data: null,
   view: 'models',
   expanded: false,
@@ -19,15 +17,12 @@ const state = {
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
 
-// ---------- 格式化 ----------
-
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 }
 
-/** 整数缩写：1.2K / 3.4M / 5.6B，保留三位有效数字 */
 function fmtInt(n) {
   if (n == null || !Number.isFinite(n)) return '—';
   const a = Math.abs(n);
@@ -37,7 +32,6 @@ function fmtInt(n) {
   return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
-/** 金额：小于 1 分也显示，不显示成 $0 */
 function fmtUSD(micro) {
   if (micro == null || !Number.isFinite(micro)) return '—';
   const v = micro / 1e6;
@@ -58,7 +52,6 @@ function fmtMoney(v, unit) {
   return String(v);
 }
 
-/** 相对时间：刚刚 / 12 分钟前 / 3 小时前 / 10-24 */
 function fmtAgo(ms) {
   if (!ms) return '—';
   const diff = Date.now() - ms;
@@ -87,8 +80,6 @@ function daysAgoKey(n) {
   return dayKey(d);
 }
 
-// ---------- 静态模式：解密与合并 ----------
-
 let staticData = null;
 let staticPass = null;
 
@@ -115,7 +106,6 @@ async function decryptJSON(enc, passphrase) {
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
-/** 价格表索引（与采集端口径一致） */
 function buildPriceIdx(prices) {
   const eff = (prices && prices.d) || '1970-01-01';
   const idx = new Map();
@@ -192,7 +182,6 @@ async function loadJSON(path) {
   return res.json();
 }
 
-/** 口令门：等用户在页面上输入 */
 function askPassphrase(message = '') {
   return new Promise((resolve) => {
     document.body.classList.add('locked');
@@ -251,8 +240,6 @@ async function loadStaticData() {
   return staticData;
 }
 
-// ---------- 聚合 ----------
-
 const emptyAgg = () => ({
   request_count: 0, success_count: 0, input_tokens: 0, output_tokens: 0,
   cache_read_tokens: 0, cache_creation_tokens: 0, cost_micro_usd: 0,
@@ -291,8 +278,6 @@ function renderKpis(total) {
   </div>`).join('');
 }
 
-// ---------- 渲染：图表 ----------
-
 function renderChart(days) {
   const el = $('#chart');
   const series = days.slice().sort((a, b) => a.key.localeCompare(b.key));
@@ -308,7 +293,6 @@ function renderChart(days) {
   }
 
   const today = dayKey(new Date());
-  // 窄屏用更小的画布，保证柱子不会被压得太细
   const narrow = window.innerWidth < 760;
   const W = narrow ? 340 : 720;
   const H = narrow ? 170 : 200;
@@ -329,19 +313,16 @@ function renderChart(days) {
       <title>${esc(d.key)}　${fmtUSD(d.cost_micro_usd)}　${fmtInt(d.request_count)} 次</title></rect>`;
   }).join('');
 
-  // Y 轴：0 / 中 / 顶
   const ticks = [0, 0.5, 1].map((f) => {
     const y = padT + ih - f * ih;
     return `<line class="grid" x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}"></line>
-      <text class="lbl" x="${padL - 7}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${fmtUSD(max * f)}</text>`;
+      <text class="lbl num" x="${padL - 7}" y="${(y + 3.5).toFixed(1)}" text-anchor="end">${fmtUSD(max * f)}</text>`;
   }).join('');
 
-  // X 轴：均匀取 3 个点
-  const idxs = [...new Set([0, Math.floor(series.length / 2), series.length - 1])]
-    .filter((i) => series[i]);
+  const idxs = [...new Set([0, Math.floor(series.length / 2), series.length - 1])].filter((i) => series[i]);
   const xLabels = idxs.map((i) => {
     const x = padL + (iw * (i + 0.5)) / series.length;
-    return `<text class="lbl" x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle">${esc(series[i].key.slice(5))}</text>`;
+    return `<text class="lbl num" x="${x.toFixed(1)}" y="${H - 6}" text-anchor="middle">${esc(series[i].key.slice(5))}</text>`;
   }).join('');
 
   el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img"
@@ -351,8 +332,6 @@ function renderChart(days) {
     ${bars}${xLabels}
   </svg>`;
 }
-
-// ---------- 渲染：额度 ----------
 
 function windowLabel(w) {
   switch (w) {
@@ -369,8 +348,6 @@ function windowLabel(w) {
 
 function renderQuotas(quotas) {
   const el = $('#details');
-
-  // 同一账号的同一种额度只显示最新的快照。
   const merged = new Map();
   for (const q of quotas) {
     const key = `${q.usage_account_key || q.account_key}\u0000${q.window_key}`;
@@ -389,29 +366,18 @@ function renderQuotas(quotas) {
     }
   }
 
-  const list = [...merged.values()];
-
-  // 过滤：没有套餐额度、又不是余额的，属于噪音
-  const meaningful = list.filter((q) => {
-    const noPlan = q.unit === 'requests' && q.total === 0 && q.remaining === 0;
-    return !noPlan;
-  });
-
-  if (!meaningful.length) {
-    el.innerHTML = `<div class="empty">
-      此时段有用量的账号暂无可显示的额度
-    </div>`;
+  const list = [...merged.values()].filter((q) => !(q.unit === 'requests' && q.total === 0 && q.remaining === 0));
+  if (!list.length) {
+    el.innerHTML = '<div class="empty">此时段有用量的账号暂无可显示的额度</div>';
     return;
   }
 
-  // 排序：真余额（有 total 的、越少越靠前，更需要留意）
-  // → 余额类的绝对值 → 已用量 → 其它
   const rank = (q) => {
     if (q.window_key === 'used') return 2;
     if (q.remaining == null) return 3;
     return q.total ? 0 : 1;
   };
-  meaningful.sort((a, b) => {
+  list.sort((a, b) => {
     const ra = rank(a); const rb = rank(b);
     if (ra !== rb) return ra - rb;
     if (ra === 0) return (a.remaining / a.total) - (b.remaining / b.total);
@@ -420,7 +386,7 @@ function renderQuotas(quotas) {
     return String(a.provider_label).localeCompare(String(b.provider_label));
   });
 
-  const cards = meaningful.map((q) => {
+  const cards = list.map((q) => {
     const pct = (q.remaining != null && q.total)
       ? Math.max(0, Math.min(100, q.remaining / q.total * 100))
       : null;
@@ -432,7 +398,6 @@ function renderQuotas(quotas) {
       tags.push(`<span class="tag">${esc(fmtAgo(q.reset_at_ms))}重置</span>`);
     }
     const apps = [...(q.apps || [q.app_type])].join(' · ');
-
     return `<div class="quota${q.stale ? ' stale' : ''}">
       <div class="quota-top">
         <span class="quota-name">${esc(q.provider_label)}</span>
@@ -448,8 +413,6 @@ function renderQuotas(quotas) {
   el.innerHTML = `<p class="detail-note">显示时段内有用量的账号，余额为最近一次采集值。</p>
     <div class="quotas">${cards}</div>`;
 }
-
-// ---------- 渲染：排行列表 ----------
 
 function renderDetails() {
   if (!state.data) return;
@@ -496,7 +459,6 @@ async function refresh() {
   const to = dayKey(new Date());
   const dashboard = $('#dashboard');
   dashboard.setAttribute('aria-busy', 'true');
-  $('#open-share').disabled = true;
 
   try {
     let summary;
@@ -553,7 +515,7 @@ async function refresh() {
       return refresh();
     }
     state.data = null;
-    $('#range-context').textContent = `用量加载失败，请刷新页面。(${error.message})`;
+    $('#range-context').textContent = `用量加载失败 (${error.message})`;
     $('#kpis').replaceChildren();
     $('#details').replaceChildren();
     $('#chart').replaceChildren();
@@ -561,7 +523,6 @@ async function refresh() {
   } finally {
     if (refreshId === state.refreshId) {
       dashboard.setAttribute('aria-busy', 'false');
-      $('#open-share').disabled = !state.data?.summary.days?.length;
     }
   }
 }
@@ -620,165 +581,7 @@ function bindTabs() {
   }
 }
 
-const posterThemes = {
-  iris: { background: '#140e23', paper: '#f7eefc', muted: '#cdbdde', accent: '#d9b8ff' },
-  mint: { background: '#102721', paper: '#eff8ed', muted: '#b5d2c6', accent: '#a7f0c8' },
-  sunset: { background: '#2d171d', paper: '#fff1e8', muted: '#e6c0b4', accent: '#ffbf9d' },
-};
-
-function drawPoster(canvas, { summary, period }, theme, includeCost, artwork) {
-  const ctx = canvas.getContext('2d');
-  const { width, height } = canvas;
-  const palette = posterThemes[theme];
-  ctx.fillStyle = palette.background;
-  ctx.fillRect(0, 0, width, height);
-
-  if (artwork) {
-    ctx.save();
-    ctx.globalCompositeOperation = 'screen';
-    ctx.globalAlpha = 0.77;
-    ctx.drawImage(artwork, 390, -12, 730, 730);
-    ctx.restore();
-    const feather = ctx.createLinearGradient(390, 0, 635, 0);
-    feather.addColorStop(0, palette.background);
-    feather.addColorStop(1, palette.background + '00');
-    ctx.fillStyle = feather;
-    ctx.fillRect(390, 0, 245, 718);
-  }
-  const shade = ctx.createLinearGradient(0, 265, 0, 730);
-  shade.addColorStop(0, palette.background + '00');
-  shade.addColorStop(1, palette.background);
-  ctx.fillStyle = shade;
-  ctx.fillRect(0, 265, width, 465);
-
-  function text(value, x, y, size, { weight = 500, color = palette.paper, serif = false, maxWidth = width - x - 86 } = {}) {
-    const family = serif ? 'Georgia, "Songti SC", "Noto Serif CJK SC", serif'
-      : 'system-ui, "PingFang SC", "Microsoft YaHei", sans-serif';
-    ctx.font = `${weight} ${size}px ${family}`;
-    ctx.fillStyle = color;
-    ctx.fillText(value, x, y, maxWidth);
-  }
-
-  function rule(y) {
-    ctx.fillStyle = palette.muted + '55';
-    ctx.fillRect(86, y, 908, 2);
-  }
-
-  const total = summary.total || emptyAgg();
-  const days = summary.days.slice().sort((a, b) => a.key.localeCompare(b.key));
-  text('我的 AI 使用记录', 86, 146, 60, { serif: true, weight: 600 });
-  text(period.replaceAll('-', '.'), 88, 206, 30, { color: palette.muted });
-
-  text(fmtInt(total.request_count), 74, 510, 212, { serif: true, maxWidth: 890 });
-  text('次请求', 89, 581, 42, { color: palette.accent });
-  rule(650);
-
-  const metrics = [
-    ['输入 Token', fmtInt(total.input_tokens)],
-    ['输出 Token', fmtInt(total.output_tokens)],
-  ];
-  metrics.forEach(([label, value], index) => {
-    const x = 87 + index * 470;
-    text(label, x, 726, 32, { color: palette.muted });
-    text(value, x, 816, 69, { serif: true, maxWidth: 425 });
-  });
-  if (includeCost) text(`总花费  ${fmtUSD(total.cost_micro_usd)}`, 88, 888, 34, { color: palette.accent });
-
-  const sectionTop = includeCost ? 929 : 885;
-  rule(sectionTop);
-  text('每日请求', 87, sectionTop + 64, 36, { weight: 600 });
-  text(`${days.length} 天有记录`, 780, sectionTop + 62, 28, { color: palette.muted });
-
-  const chartLeft = 88;
-  const chartRight = 992;
-  const chartBottom = 1260;
-  const chartHeight = chartBottom - sectionTop - 104;
-  const first = Date.parse(days[0].key);
-  const span = Math.round((Date.parse(days[days.length - 1].key) - first) / 86400000) + 1;
-  const step = (chartRight - chartLeft) / span;
-  const max = days.reduce((highest, day) => Math.max(highest, day.request_count), 1);
-  for (const ratio of [0, 0.5, 1]) rule(chartBottom - chartHeight * ratio);
-
-  const gradient = ctx.createLinearGradient(0, chartBottom - chartHeight, 0, chartBottom);
-  gradient.addColorStop(0, palette.accent);
-  gradient.addColorStop(1, palette.accent + '64');
-  ctx.fillStyle = gradient;
-  const barWidth = Math.max(1, Math.min(32, step * 0.72));
-  for (const day of days) {
-    const offset = (Date.parse(day.key) - first) / 86400000;
-    const x = chartLeft + step * (offset + 0.5) - barWidth / 2;
-    const barHeight = day.request_count / max * chartHeight;
-    ctx.fillRect(x, chartBottom - barHeight, barWidth, barHeight);
-  }
-  text(days[0].key.slice(5).replace('-', '.'), 88, 1314, 27, { color: palette.muted });
-  if (days.length > 1) {
-    ctx.textAlign = 'right';
-    text(days[days.length - 1].key.slice(5).replace('-', '.'), 992, 1314, 27,
-      { color: palette.muted, maxWidth: 200 });
-    ctx.textAlign = 'left';
-  }
-}
-
-function bindShareControls() {
-  const picker = $('#theme-picker');
-  const dialog = $('#share-dialog');
-  const cost = $('#include-cost');
-  const nativeShare = $('#native-share');
-  const preview = $('#share-preview');
-  const save = $('#save-poster');
-  const canvas = document.createElement('canvas');
-  canvas.width = 1080;
-  canvas.height = 1440;
-  let snapshot;
-  let file;
-  const artwork = new Image();
-  artwork.src = './usage-cover.webp';
-
-  try {
-    const saved = localStorage.getItem('usage-theme');
-    if (Object.hasOwn(posterThemes, saved)) picker.value = saved;
-  } catch { /* 浏览器可能禁用本地存储 */ }
-  document.documentElement.dataset.theme = picker.value;
-  picker.addEventListener('change', () => {
-    document.documentElement.dataset.theme = picker.value;
-    try { localStorage.setItem('usage-theme', picker.value); } catch { /* 仅在本次页面生效 */ }
-  });
-
-  const updatePoster = () => {
-    drawPoster(canvas, snapshot, picker.value, cost.checked, artwork.naturalWidth ? artwork : null);
-    const data = canvas.toDataURL('image/png');
-    const filename = `AI-用量-${snapshot.endDate}.png`;
-    preview.src = data;
-    save.href = data;
-    save.download = filename;
-    file = new File([b64ToBytes(data.split(',')[1])], filename, { type: 'image/png' });
-    nativeShare.hidden = !navigator.canShare?.({ files: [file] });
-  };
-  $('#open-share').addEventListener('click', () => {
-    if (!state.data?.summary.days?.length) return;
-    snapshot = state.data;
-    updatePoster();
-    dialog.showModal();
-  });
-  artwork.addEventListener('load', () => {
-    if (dialog.open) updatePoster();
-  });
-  cost.addEventListener('change', updatePoster);
-  nativeShare.addEventListener('click', async () => {
-    try {
-      await navigator.share({ files: [file], title: '我的 AI 用量' });
-    } catch (error) {
-      if (error.name !== 'AbortError') {
-        nativeShare.hidden = true;
-        save.focus();
-      }
-    }
-  });
-}
-
 async function boot() {
-  bindShareControls();
-  // 判定模式：存在 data/index.json 且 mode=static 就是静态站
   try {
     const res = await fetch('./data/index.json', { cache: 'no-store' });
     if (res.ok) {
@@ -789,7 +592,7 @@ async function boot() {
         if (j.encrypted) document.body.classList.add('locked');
       }
     }
-  } catch { /* 没有清单就是 server 模式 */ }
+  } catch { /* server 模式 */ }
 
   await refresh();
   bindTabs();
